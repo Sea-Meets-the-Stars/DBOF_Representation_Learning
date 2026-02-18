@@ -1,31 +1,43 @@
-# ----------------------
-# IDEs
-# ----------------------
-.idea/
+# Generic gitignore for now :
+build/
+dist/
 
-# ----------------------
-# Python virtual environments
-# ----------------------
-venv/
-.venv/
-env/
-.env/
-
-# ----------------------
-# Python cache / build
-# ----------------------
+# Python
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
 *.pyd
+*.egg-info/
 
-# ----------------------
+# Virtual environment
+.venv/
+.venv1/
+.venv_o/
+venv/
+env/
+
 # Jupyter
-# ----------------------
 .ipynb_checkpoints/
+*.ipynb~
 
-# ----------------------
-# OS junk
-# ----------------------
+# OS files
 .DS_Store
 Thumbs.db
+
+# Logs / temp
+*.log
+*.tmp
+*.temp
+
+# Cache
+.cache/
+.mypy_cache/
+.pytest_cache/
+
+# Idea
+.idea/
+
+# Generated dataset_creation
+*.zarr
+*.parquet
+

@@ -2,25 +2,30 @@ from dask.distributed import Client
 import torch
 from torch.utils.data import Dataset, DataLoader
 
+
 class DBOFCutoutInMemoryDataset(Dataset):
 
-    def __init__(self, reader, subset= None, transform=None):
+    def __init__(self, reader, transform=None, subset=None):
         client = Client()
 
         self.reader = reader
         self.transform = transform
+        self.subset = subset
 
         images_da, ids_da, valid_mask_da = reader.full_dataset_as_dask()
 
-        if subset is not None:
-            images_da = images_da[:subset]
-            ids_da = ids_da[:subset]
+        if self.subset is not None:
+            print("Loading Images into memory...")
+            images_np = images_da[:subset].compute()
+            print("Loading ids into memory...")
+            ids_np = ids_da[:subset].compute()
 
-        # subset for now
-        print(f"Loading Images into memory {images_da.shape} ...")
-        images_np = images_da.compute()
-        print(f"Loading ids into memory {ids_da.shape} ...")
-        ids_np = ids_da.compute()
+        else:
+            print("Loading Images into memory...")
+            images_np = images_da.compute()
+            print("Loading ids into memory...")
+            ids_np = ids_da.compute()
+
         mask = (ids_np != b"")
 
         self.images = images_np[mask]
@@ -41,16 +46,17 @@ class DBOFCutoutInMemoryDataset(Dataset):
 
         return x
 
-def make_dbof_cutout_dataloader(reader, subset=None, batch_size=64, num_workers=0, transform=None):
-    dataset = DBOFCutoutInMemoryDataset(reader, subset=subset, transform=transform)
+
+def make_dbof_cutout_dataloader(reader, batch_size=64, transform=None, subset=None):
+    dataset = DBOFCutoutInMemoryDataset(reader, transform=transform, subset=subset)
 
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,  # works (map-style)
-        drop_last=True,  # common for SSL/DINO
-        num_workers=num_workers,
+        shuffle=True,
+        drop_last=True,
+        num_workers=0,  # with dask loading we cannot support multiple workers
         pin_memory=True,
-        persistent_workers=(num_workers > 0),
+        persistent_workers=False,
     )
     return loader

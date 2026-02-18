@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fronts representation learning"
+name = "fronts_representation_learning"
 version = "0.0.dev0"
 readme = "README.md"
 license = { text = "BSD" }
@@ -40,8 +40,8 @@ plotting = [
 
 test = ["pytest"]
 
-#[tool.setuptools.packages.find]
-#where = ["src"]
+[tool.setuptools.packages.find]
+where = ["src"]
 #
 #[project.scripts]
 #generate-llc-dataset = "dbof.cli.generate_front_training_data:main"
