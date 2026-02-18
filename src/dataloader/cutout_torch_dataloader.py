@@ -1,13 +1,12 @@
 from dask.distributed import Client
 import torch
 from torch.utils.data import Dataset, DataLoader
-
+from dask.distributed import progress
+from dask.diagnostics import ProgressBar
 
 class DBOFCutoutInMemoryDataset(Dataset):
 
-    def __init__(self, reader, transform=None, subset=None):
-        client = Client()
-
+    def __init__(self, reader, client, transform=None, subset=None):
         self.reader = reader
         self.transform = transform
         self.subset = subset
@@ -16,15 +15,22 @@ class DBOFCutoutInMemoryDataset(Dataset):
 
         if self.subset is not None:
             print("Loading Images into memory...")
-            images_np = images_da[:subset].compute()
+            with ProgressBar():
+                images_np = images_da[:subset].compute()
+
             print("Loading ids into memory...")
-            ids_np = ids_da[:subset].compute()
+            with ProgressBar():
+                ids_np = ids_da[:subset].compute()
+
 
         else:
             print("Loading Images into memory...")
-            images_np = images_da.compute()
+            with ProgressBar():
+                images_np = images_da.compute()
+
             print("Loading ids into memory...")
-            ids_np = ids_da.compute()
+            with ProgressBar():
+                ids_np = ids_da.compute()
 
         mask = (ids_np != b"")
 
@@ -47,8 +53,8 @@ class DBOFCutoutInMemoryDataset(Dataset):
         return x
 
 
-def make_dbof_cutout_dataloader(reader, batch_size=64, transform=None, subset=None):
-    dataset = DBOFCutoutInMemoryDataset(reader, transform=transform, subset=subset)
+def make_dbof_cutout_dataloader(reader, dask_client, batch_size=64, transform=None, subset=None):
+    dataset = DBOFCutoutInMemoryDataset(reader, dask_client, transform=transform, subset=subset)
 
     loader = DataLoader(
         dataset,

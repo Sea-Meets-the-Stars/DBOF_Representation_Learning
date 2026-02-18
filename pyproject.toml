@@ -27,6 +27,7 @@ dependencies = [
     "xmitgcm",
     "dask==2025.10.0",
     "s3fs==2025.9.0",
+    "ipywidgets"
 ]
 
 [project.optional-dependencies]
