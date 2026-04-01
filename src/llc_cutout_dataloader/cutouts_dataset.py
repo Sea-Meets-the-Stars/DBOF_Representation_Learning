@@ -27,7 +27,7 @@ class Cutouts(Dataset):
         return sample
 
 
-def make_dataloader(X, mean, std, batch_size=64, num_workers=0):
+def make_dataloader(X, mean, std, batch_size=64, num_workers=0, shuffle=False):
     transforms = torchtransforms.Compose([
         torchtransforms.Normalize(mean=mean, std=std)
     ])
@@ -37,7 +37,7 @@ def make_dataloader(X, mean, std, batch_size=64, num_workers=0):
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=True,
     )
@@ -121,7 +121,8 @@ def filter_invalid_cutouts(images_np, feature_channels = ['Eta', 'Salt', 'Theta'
     # keep_mask[ice_indices] = False
     # images_clean_no_ice_np = images_clean_np[keep_mask]
 
-
+    
+    theta = images_np[:, feature_channels.index("Theta")]  # (N, 64, 64)
     # Boolean mask: True if patch has any NaN
     bad_patch_mask = np.isnan(theta).reshape(theta.shape[0], -1).any(axis=1)
     images_np = filter_based_on_mask(images_np, bad_patch_mask)
