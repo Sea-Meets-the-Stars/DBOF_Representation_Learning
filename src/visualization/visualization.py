@@ -1,5 +1,5 @@
 import matplotlib.pyplot as plt
-
+import numpy as np
 
 def _make_ax(fig, dims, subplot=(1, 1, 1)):
     if dims not in (2, 3):
