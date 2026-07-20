@@ -7,10 +7,13 @@ def _make_ax(fig, dims, subplot=(1, 1, 1)):
     return fig.add_subplot(*subplot, projection="3d" if dims == 3 else None)
 
 
-def _scatter_embedding(ax, X_d, labels=None, dims=2, alpha=0.5, s=0.1, cmap="tab10"):
+def _scatter_embedding(ax, X_d, labels=None, categorical=True, dims=2, alpha=0.5, s=0.1, cmap="tab10"):
     kw = dict(s=s, alpha=alpha)
     if labels is not None:
-        kw.update(c=labels, cmap=cmap)
+        if categorical :
+            kw.update(c=labels, cmap=cmap)
+        else :
+            kw.update(cmap=cmap)
     scatter = ax.scatter(*[X_d[:, i] for i in range(dims)], **kw)
     ax.set_xlabel("C1")
     ax.set_ylabel("C2")
@@ -38,18 +41,18 @@ def _labels_per_embedding(labels, n):
     return [labels] * n             # single shared (N,) array
 
 
-def vis_dim_redux(X_d, labels=None, label_title="class", dims=2, alpha=0.5):
+def vis_dim_redux(X_d, labels=None, categorical=True, label_title="class", dims=2, alpha=0.5, cmap="tab10"):
     fig = plt.figure(figsize=(8, 6))
     ax = _make_ax(fig, dims)
-    scatter = _scatter_embedding(ax, X_d, labels=labels, dims=dims, alpha=alpha)
+    scatter = _scatter_embedding(ax, X_d, labels=labels, dims=dims, alpha=alpha, cmap=cmap, categorical=categorical)
     if labels is not None:
         _add_class_legend(ax, scatter, label_title)
     _set_limits(ax, X_d, dims, pct=1.0)
     plt.show()
 
 
-def vis_dim_redux_list(embeddings, labels=None, titles=None, label_title="class",
-                       dims=2, alpha=0.5, n_cols=3):
+def vis_dim_redux_list(embeddings, labels=None, categorical=True, titles=None, label_title="class",
+                       dims=2, alpha=0.5, n_cols=3, cmap="tab10"):
     """Scatter a list/array of embeddings in a grid.
 
     embeddings : iterable of (N, dims) arrays, or an (M, N, dims) array.
@@ -65,7 +68,7 @@ def vis_dim_redux_list(embeddings, labels=None, titles=None, label_title="class"
     fig = plt.figure(figsize=(6 * n_cols, 5 * n_rows))
     for i, X_d in enumerate(embeddings):
         ax = _make_ax(fig, dims, (n_rows, n_cols, i + 1))
-        scatter = _scatter_embedding(ax, X_d, labels=per_labels[i], dims=dims, alpha=alpha)
+        scatter = _scatter_embedding(ax, X_d, labels=per_labels[i], categorical=categorical, dims=dims, alpha=alpha, cmap=cmap)
         if titles is not None:
             ax.set_title(titles[i])
         if per_labels[i] is not None:
