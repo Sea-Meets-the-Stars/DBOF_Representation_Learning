@@ -7,13 +7,10 @@ def _make_ax(fig, dims, subplot=(1, 1, 1)):
     return fig.add_subplot(*subplot, projection="3d" if dims == 3 else None)
 
 
-def _scatter_embedding(ax, X_d, labels=None, categorical=True, dims=2, alpha=0.5, s=0.1, cmap="tab10"):
+def _scatter_embedding(ax, X_d, labels=None, dims=2, alpha=0.5, s=0.1, cmap="tab10"):
     kw = dict(s=s, alpha=alpha)
     if labels is not None:
-        if categorical :
-            kw.update(c=labels, cmap=cmap)
-        else :
-            kw.update(cmap=cmap)
+        kw.update(c=labels, cmap=cmap)
     scatter = ax.scatter(*[X_d[:, i] for i in range(dims)], **kw)
     ax.set_xlabel("C1")
     ax.set_ylabel("C2")
@@ -32,6 +29,14 @@ def _add_class_legend(ax, scatter, label_title):
     ax.add_artist(ax.legend(*scatter.legend_elements(), title=label_title))
 
 
+def _annotate(fig, ax, scatter, categorical, label_title):
+    """Categorical -> discrete class legend; numerical -> colorbar."""
+    if categorical:
+        _add_class_legend(ax, scatter, label_title)
+    else:
+        fig.colorbar(scatter, ax=ax, label=label_title)
+
+
 def _labels_per_embedding(labels, n):
     """None, a shared (N,) array, or n per-embedding label arrays -> list of length n."""
     if labels is None:
@@ -41,18 +46,19 @@ def _labels_per_embedding(labels, n):
     return [labels] * n             # single shared (N,) array
 
 
-def vis_dim_redux(X_d, labels=None, categorical=True, label_title="class", dims=2, alpha=0.5, cmap="tab10"):
+def vis_dim_redux(X_d, labels=None, categorical=True, label_title="class", dims=2, alpha=0.5, cmap=None):
+    cmap = cmap or ("tab10" if categorical else "viridis")
     fig = plt.figure(figsize=(8, 6))
     ax = _make_ax(fig, dims)
-    scatter = _scatter_embedding(ax, X_d, labels=labels, dims=dims, alpha=alpha, cmap=cmap, categorical=categorical)
+    scatter = _scatter_embedding(ax, X_d, labels=labels, dims=dims, alpha=alpha, cmap=cmap)
     if labels is not None:
-        _add_class_legend(ax, scatter, label_title)
+        _annotate(fig, ax, scatter, categorical, label_title)
     _set_limits(ax, X_d, dims, pct=1.0)
     plt.show()
 
 
 def vis_dim_redux_list(embeddings, labels=None, categorical=True, titles=None, label_title="class",
-                       dims=2, alpha=0.5, n_cols=3, cmap="tab10"):
+                       dims=2, alpha=0.5, n_cols=3, cmap=None):
     """Scatter a list/array of embeddings in a grid.
 
     embeddings : iterable of (N, dims) arrays, or an (M, N, dims) array.
@@ -60,6 +66,7 @@ def vis_dim_redux_list(embeddings, labels=None, categorical=True, titles=None, l
                  array per embedding (e.g. member_clusters of shape (M, N)).
     titles     : optional per-panel titles.
     """
+    cmap = cmap or ("tab10" if categorical else "viridis")
     n = len(embeddings)
     n_cols = min(n_cols, n)
     n_rows = -(-n // n_cols)                      # ceil
@@ -68,11 +75,11 @@ def vis_dim_redux_list(embeddings, labels=None, categorical=True, titles=None, l
     fig = plt.figure(figsize=(6 * n_cols, 5 * n_rows))
     for i, X_d in enumerate(embeddings):
         ax = _make_ax(fig, dims, (n_rows, n_cols, i + 1))
-        scatter = _scatter_embedding(ax, X_d, labels=per_labels[i], categorical=categorical, dims=dims, alpha=alpha, cmap=cmap)
+        scatter = _scatter_embedding(ax, X_d, labels=per_labels[i], dims=dims, alpha=alpha, cmap=cmap)
         if titles is not None:
             ax.set_title(titles[i])
         if per_labels[i] is not None:
-            _add_class_legend(ax, scatter, label_title)
+            _annotate(fig, ax, scatter, categorical, label_title)
         _set_limits(ax, X_d, dims, pct=1.0)
     fig.tight_layout()
     plt.show()
