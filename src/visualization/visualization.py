@@ -1,10 +1,18 @@
 import colorsys
 import itertools
 
+import cmocean
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import BoundaryNorm, ListedColormap
 from einops import rearrange
+
+from dbof.plotting.field_cmaps import load_field_cmaps
+
+try:
+    _FIELD_CMAPS, _DIVERGING_CMAPS = load_field_cmaps()   # {channel: (cmocean_name, label)}
+except Exception:
+    _FIELD_CMAPS, _DIVERGING_CMAPS = {}, set()
 
 def _make_ax(fig, dims, subplot=(1, 1, 1)):
     if dims not in (2, 3):
@@ -112,6 +120,22 @@ def _resolve_features(features, channel_names):
     return out
 
 
+def _field_style(name, data):
+    """(cmap, vmin, vmax) for a field from the llc4320 registry: diverging fields
+    (balance/curl) centered at zero, others on robust 1-99 percentiles.  Falls
+    back to the matplotlib default cmap for channels not in the registry."""
+    spec = _FIELD_CMAPS.get(name)
+    cmap = getattr(cmocean.cm, spec[0], None) if spec else None
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        return cmap, None, None
+    if spec and spec[0] in _DIVERGING_CMAPS:
+        m = float(np.abs(finite).max())
+        return cmap, -m, m
+    lo, hi = np.percentile(finite, [1, 99])
+    return cmap, float(lo), float(hi)
+
+
 def _format_meta(row, fields):
     if row is None:
         return ""
@@ -134,14 +158,17 @@ def make_image_from_patches(cutouts_dataloader, patched_loader, labels, *,
                             batch_index=0, batch_size=64, patch_size=8,
                             number_rows=6, metadata=None,
                             metadata_fields=_DEFAULT_META_FIELDS,
-                            panel_size=3, cmap=None):
+                            panel_size=3, cmap=None,
+                            meta_fontsize=None, title_fontsize=None, save_path=None):
     """Grid of cutouts: one panel per selected feature (titled with its zarr
-    channel name) + a cluster-label overlay, and a metadata caption under each row.
+    channel name, colored with its llc4320 field colormap) + a cluster-label
+    overlay, and a metadata caption under each row.
 
     features         : channel names/indices to show (default: all channels).
     label_overlay_on : channel name/index used as the overlay background.
     metadata         : id-indexed DataFrame; defaults to cutouts_dataloader.dataset.metadata.
                        Looked up per cutout by its id (order-independent).
+    save_path        : if given, save the figure there before showing.
 
     Requires non-shuffled, deterministic loaders so ``labels`` (flat, in loader
     order) line up with the re-iterated patches.
@@ -153,6 +180,10 @@ def make_image_from_patches(cutouts_dataloader, patched_loader, labels, *,
     ids = getattr(ds, "ids", None)
     feats = _resolve_features(features, channel_names)
     bg_idx = _resolve_features([label_overlay_on], channel_names)[0][0]
+    bg_name = channel_names[bg_idx] if channel_names else None
+
+    meta_fontsize = meta_fontsize or int(panel_size * 6)
+    title_fontsize = title_fontsize or int(panel_size * 4)
 
     batch_imgs = next(itertools.islice(iter(cutouts_dataloader), batch_index, None))
     batch_patches = next(itertools.islice(iter(patched_loader), batch_index, None))
@@ -165,9 +196,9 @@ def make_image_from_patches(cutouts_dataloader, patched_loader, labels, *,
     norm = BoundaryNorm(np.arange(n_clusters + 1) - 0.5, n_clusters)
 
     n_col = len(feats) + 1
-    fig = plt.figure(figsize=(panel_size * n_col, panel_size * 1.2 * number_rows))
+    fig = plt.figure(figsize=(panel_size * n_col, panel_size * 1.4 * number_rows))
     gs = fig.add_gridspec(number_rows * 2, n_col,
-                          height_ratios=[6, 1] * number_rows, hspace=0.06, wspace=0.05)
+                          height_ratios=[6, 2] * number_rows, hspace=0.06, wspace=0.05)
 
     for r in range(number_rows):
         img = np.asarray(batch_imgs[r])
@@ -176,14 +207,17 @@ def make_image_from_patches(cutouts_dataloader, patched_loader, labels, *,
 
         for col, (idx, name) in enumerate(feats):
             ax = fig.add_subplot(gs[2 * r, col])
-            ax.imshow(img[idx]); ax.set_xticks([]); ax.set_yticks([])
+            f_cmap, vmin, vmax = _field_style(name, img[idx])
+            ax.imshow(img[idx], cmap=f_cmap, vmin=vmin, vmax=vmax)
+            ax.set_xticks([]); ax.set_yticks([])
             if r == 0:
-                ax.set_title(name, fontsize=9)
+                ax.set_title(name, fontsize=title_fontsize)
 
         ax = fig.add_subplot(gs[2 * r, len(feats)])
         bg = rearrange(np.asarray(batch_patches[r][:, bg_idx]),
                        '(h w) p1 p2 -> (h p1) (w p2)', h=n_h, w=n_w)
-        ax.imshow(bg, extent=[0, W, H, 0])
+        bg_cmap, bg_vmin, bg_vmax = _field_style(bg_name, bg)
+        ax.imshow(bg, extent=[0, W, H, 0], cmap=bg_cmap, vmin=bg_vmin, vmax=bg_vmax)
         start = batch_index * batch_size * patches_per_image + r * patches_per_image
         patch_labels = labels[start:start + patches_per_image]
         assert patch_labels.size == n_h * n_w, \
@@ -196,7 +230,7 @@ def make_image_from_patches(cutouts_dataloader, patched_loader, labels, *,
             ax.axvline(g, color="k", lw=0.8, alpha=0.6)
         ax.set_xticks([]); ax.set_yticks([])
         if r == 0:
-            ax.set_title("clusters", fontsize=9)
+            ax.set_title("clusters", fontsize=title_fontsize)
 
         cap = fig.add_subplot(gs[2 * r + 1, :]); cap.axis("off")
         k = batch_index * batch_size + r
@@ -204,6 +238,8 @@ def make_image_from_patches(cutouts_dataloader, patched_loader, labels, *,
                if metadata is not None and ids is not None and ids[k] in metadata.index
                else None)
         cap.text(0.01, 0.5, _format_meta(row, metadata_fields),
-                 va="center", ha="left", fontsize=9, family="monospace")
+                 va="center", ha="left", fontsize=meta_fontsize, family="monospace")
 
-    return fig
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
