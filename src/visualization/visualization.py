@@ -1,6 +1,9 @@
 import colorsys
 import itertools
+import os
 
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
 import cmocean
 import matplotlib.pyplot as plt
 import numpy as np
@@ -20,10 +23,10 @@ def _make_ax(fig, dims, subplot=(1, 1, 1)):
     return fig.add_subplot(*subplot, projection="3d" if dims == 3 else None)
 
 
-def _scatter_embedding(ax, X_d, labels=None, dims=2, alpha=0.5, s=0.1, cmap="tab10"):
+def _scatter_embedding(ax, X_d, labels=None, dims=2, alpha=0.5, s=0.1, cmap=None, norm=None):
     kw = dict(s=s, alpha=alpha)
     if labels is not None:
-        kw.update(c=labels, cmap=cmap)
+        kw.update(c=labels, cmap=cmap, norm=norm)
     scatter = ax.scatter(*[X_d[:, i] for i in range(dims)], **kw)
     ax.set_xlabel("C1")
     ax.set_ylabel("C2")
@@ -60,10 +63,14 @@ def _labels_per_embedding(labels, n):
 
 
 def vis_dim_redux(X_d, labels=None, categorical=True, label_title="class", dims=2, alpha=0.5, cmap=None):
-    cmap = cmap or ("tab10" if categorical else "viridis")
+    norm = None
+    if labels is not None and categorical:
+        cmap, norm = _cluster_cmap_norm(labels, cmap)
+    else:
+        cmap = cmap or "viridis"
     fig = plt.figure(figsize=(8, 6))
     ax = _make_ax(fig, dims)
-    scatter = _scatter_embedding(ax, X_d, labels=labels, dims=dims, alpha=alpha, cmap=cmap)
+    scatter = _scatter_embedding(ax, X_d, labels=labels, dims=dims, alpha=alpha, cmap=cmap, norm=norm)
     if labels is not None:
         _annotate(fig, ax, scatter, categorical, label_title)
     _set_limits(ax, X_d, dims, pct=1.0)
@@ -79,7 +86,6 @@ def vis_dim_redux_list(embeddings, labels=None, categorical=True, titles=None, l
                  array per embedding (e.g. member_clusters of shape (M, N)).
     titles     : optional per-panel titles.
     """
-    cmap = cmap or ("tab10" if categorical else "viridis")
     n = len(embeddings)
     n_cols = min(n_cols, n)
     n_rows = -(-n // n_cols)                      # ceil
@@ -88,7 +94,12 @@ def vis_dim_redux_list(embeddings, labels=None, categorical=True, titles=None, l
     fig = plt.figure(figsize=(6 * n_cols, 5 * n_rows))
     for i, X_d in enumerate(embeddings):
         ax = _make_ax(fig, dims, (n_rows, n_cols, i + 1))
-        scatter = _scatter_embedding(ax, X_d, labels=per_labels[i], dims=dims, alpha=alpha, cmap=cmap)
+        lab = per_labels[i]
+        if lab is not None and categorical:
+            pc, pn = _cluster_cmap_norm(lab, cmap)
+        else:
+            pc, pn = (cmap or "viridis"), None
+        scatter = _scatter_embedding(ax, X_d, labels=lab, dims=dims, alpha=alpha, cmap=pc, norm=pn)
         if titles is not None:
             ax.set_title(titles[i])
         if per_labels[i] is not None:
@@ -107,6 +118,27 @@ def distinct_cmap(n):
                                   0.55 + 0.35 * (i % 2),
                                   0.75 + 0.20 * ((i // 2) % 2)) for i in range(n)]
     return ListedColormap(colors)
+
+
+_NOISE_COLOR = (0.6, 0.6, 0.6, 1.0)   # grey slot for -1 / NaN noise
+
+
+def _cluster_cmap_norm(labels, cmap=None):
+    """Discrete cmap + BoundaryNorm for integer cluster labels, with a grey slot
+    for -1 (and NaN) noise.  Cluster k keeps its distinct_cmap(k) color, so colors
+    match across the patch grid, embedding, and map views."""
+    labels = np.asarray(labels, dtype=float)
+    finite = labels[np.isfinite(labels)]
+    hi = int(finite.max()) if finite.size else 0
+    lo = int(finite.min()) if finite.size else 0
+    base = cmap or distinct_cmap(hi + 1)
+    colors = [base(k) for k in range(hi + 1)]
+    bounds = np.arange(lo if lo < 0 else 0, hi + 2) - 0.5
+    if lo < 0:
+        colors = [_NOISE_COLOR] + colors      # -1 -> grey
+    out = ListedColormap(colors)
+    out.set_bad(_NOISE_COLOR)                  # NaN (member noise) -> grey too
+    return out, BoundaryNorm(bounds, len(colors))
 
 
 def _resolve_features(features, channel_names):
@@ -191,9 +223,7 @@ def make_image_from_patches(cutouts_dataloader, patched_loader, labels, *,
     number_rows = min(number_rows, imgs_in_batch)
 
     labels = np.asarray(labels)
-    n_clusters = int(labels.max()) + 1
-    cmap = cmap or distinct_cmap(n_clusters)
-    norm = BoundaryNorm(np.arange(n_clusters + 1) - 0.5, n_clusters)
+    cmap, norm = _cluster_cmap_norm(labels, cmap)   # grey slot for -1 noise
 
     n_col = len(feats) + 1
     fig = plt.figure(figsize=(panel_size * n_col, panel_size * 1.4 * number_rows))
@@ -243,3 +273,68 @@ def make_image_from_patches(cutouts_dataloader, patched_loader, labels, *,
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
+
+
+def plot_global_cluster_maps(cutouts_dataloader, patched_loader, labels, *,
+                             cmap=None, alpha=0.5, point_size=8, extent=None,
+                             coastlines=True, panel_size=8, drop_noise=False,
+                             save_dir=None):
+    """One global lon/lat map per timestamp; each patch is a dot colored by its
+    cluster label (-1 noise shown grey).  Emits a separate figure per timestamp.
+
+    XC/YC (lon/lat) come from the patch coordinate channels (passed through
+    unnormalized by the loader); each patch's timestamp is its cutout's
+    ``time_snapshot``.  Pass the same ``cmap`` used elsewhere so colors match.
+
+    alpha    : dot opacity (dots may overlap).
+    extent   : (lon_min, lon_max, lat_min, lat_max); default auto-fits all points,
+               shared across timestamps.  Use (-180, 180, -90, 90) for the globe.
+    save_dir : if given, save each figure as clusters_<timestamp>.png there.
+    """
+    ds = getattr(cutouts_dataloader, "dataset", None)
+    channel_names, metadata, ids = ds.channel_names, ds.metadata, ds.ids
+    xc_i, yc_i = channel_names.index("XC"), channel_names.index("YC")
+
+    lons, lats, ppi = [], [], None
+    for batch in patched_loader:                       # (B, ppi, C, p, p)
+        ppi = batch.shape[1]
+        lons.append(np.asarray(batch[:, :, xc_i].mean(dim=(-1, -2))).reshape(-1))
+        lats.append(np.asarray(batch[:, :, yc_i].mean(dim=(-1, -2))).reshape(-1))
+    lon, lat = np.concatenate(lons), np.concatenate(lats)
+
+    labels = np.asarray(labels)
+    assert labels.size == lon.size, f"{labels.size} labels vs {lon.size} patches"
+    assert len(ids) * ppi == lon.size, "cutout ids and patches are misaligned"
+
+    ts = np.repeat(metadata["time_snapshot"].reindex(np.asarray(ids)).values, ppi)
+    keep = ~np.isnat(ts)
+    if drop_noise:
+        keep &= labels >= 0
+    lon, lat, labels, ts = lon[keep], lat[keep], labels[keep], ts[keep]
+
+    cmap_d, norm = _cluster_cmap_norm(labels, cmap)
+    if extent is None:
+        m = 2.0
+        extent = (lon.min() - m, lon.max() + m, lat.min() - m, lat.max() + m)
+    ticks = np.arange(int(labels.min()), int(labels.max()) + 1)
+    proj = ccrs.PlateCarree()
+
+    for t in np.unique(ts):
+        msk = ts == t
+        fig = plt.figure(figsize=(panel_size, panel_size * 0.55))
+        ax = fig.add_subplot(1, 1, 1, projection=proj)
+        ax.set_extent(extent, crs=proj)
+        if coastlines:
+            ax.add_feature(cfeature.LAND, facecolor="0.92", zorder=0)
+            ax.coastlines(linewidth=0.5, zorder=1)
+        ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
+        sc = ax.scatter(lon[msk], lat[msk], c=labels[msk], cmap=cmap_d, norm=norm,
+                        s=point_size, alpha=alpha, linewidths=0, transform=proj, zorder=2)
+        ax.set_title(str(np.datetime64(t, "s")))
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.025, pad=0.02, label="cluster")
+        if ticks.size <= 20:
+            cbar.set_ticks(ticks)
+        if save_dir:
+            fig.savefig(os.path.join(save_dir, f"clusters_{np.datetime64(t, 's')}.png"),
+                        dpi=150, bbox_inches="tight")
+        plt.show()
