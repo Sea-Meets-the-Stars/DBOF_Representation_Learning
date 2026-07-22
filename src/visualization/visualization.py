@@ -1,5 +1,4 @@
 import colorsys
-import itertools
 import os
 
 import cartopy.crs as ccrs
@@ -8,7 +7,6 @@ import cmocean
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import BoundaryNorm, ListedColormap
-from einops import rearrange
 
 from dbof.plotting.field_cmaps import load_field_cmaps
 
@@ -185,10 +183,9 @@ def _format_meta(row, fields):
     return "     ".join(parts)
 
 
-def make_image_from_patches(cutouts_dataloader, patched_loader, labels, *,
+def make_image_from_patches(dataset, labels, *,
                             features=None, label_overlay_on=0,
-                            batch_index=0, batch_size=64, patch_size=8,
-                            number_rows=6, metadata=None,
+                            patch_size=8, start=0, number_rows=6,
                             metadata_fields=_DEFAULT_META_FIELDS,
                             panel_size=3, cmap=None,
                             meta_fontsize=None, title_fontsize=None, save_path=None):
@@ -196,31 +193,26 @@ def make_image_from_patches(cutouts_dataloader, patched_loader, labels, *,
     channel name, colored with its llc4320 field colormap) + a cluster-label
     overlay, and a metadata caption under each row.
 
-    features         : channel names/indices to show (default: all channels).
+    dataset          : CutoutDataset (provides raw X, channel_names, ids, metadata).
+    features         : channel names/indices to show (default: all features).
     label_overlay_on : channel name/index used as the overlay background.
-    metadata         : id-indexed DataFrame; defaults to cutouts_dataloader.dataset.metadata.
-                       Looked up per cutout by its id (order-independent).
+    start            : index of the first cutout to show.
     save_path        : if given, save the figure there before showing.
 
-    Requires non-shuffled, deterministic loaders so ``labels`` (flat, in loader
-    order) line up with the re-iterated patches.
+    ``labels`` are flat per-patch in dataset order (patch k -> cutout k // ppi).
     """
-    ds = getattr(cutouts_dataloader, "dataset", None)
-    channel_names = getattr(ds, "channel_names", None)
-    if metadata is None:
-        metadata = getattr(ds, "metadata", None)
-    ids = getattr(ds, "ids", None)
+    channel_names = dataset.channel_names
+    imgs, metadata, ids = dataset.X, dataset.metadata, dataset.ids
     feats = _resolve_features(features, channel_names)
     bg_idx = _resolve_features([label_overlay_on], channel_names)[0][0]
-    bg_name = channel_names[bg_idx] if channel_names else None
 
     meta_fontsize = meta_fontsize or int(panel_size * 6)
     title_fontsize = title_fontsize or int(panel_size * 4)
 
-    batch_imgs = next(itertools.islice(iter(cutouts_dataloader), batch_index, None))
-    batch_patches = next(itertools.islice(iter(patched_loader), batch_index, None))
-    imgs_in_batch, patches_per_image = batch_patches.shape[0], batch_patches.shape[1]
-    number_rows = min(number_rows, imgs_in_batch)
+    number_rows = min(number_rows, len(imgs) - start)
+    H, W = imgs.shape[2], imgs.shape[3]
+    n_h, n_w = H // patch_size, W // patch_size
+    ppi = n_h * n_w
 
     labels = np.asarray(labels)
     cmap, norm = _cluster_cmap_norm(labels, cmap)   # grey slot for -1 noise
@@ -231,9 +223,8 @@ def make_image_from_patches(cutouts_dataloader, patched_loader, labels, *,
                           height_ratios=[6, 2] * number_rows, hspace=0.06, wspace=0.05)
 
     for r in range(number_rows):
-        img = np.asarray(batch_imgs[r])
-        H, W = img.shape[1], img.shape[2]
-        n_h, n_w = H // patch_size, W // patch_size
+        c = start + r
+        img = np.asarray(imgs[c])
 
         for col, (idx, name) in enumerate(feats):
             ax = fig.add_subplot(gs[2 * r, col])
@@ -244,14 +235,10 @@ def make_image_from_patches(cutouts_dataloader, patched_loader, labels, *,
                 ax.set_title(name, fontsize=title_fontsize)
 
         ax = fig.add_subplot(gs[2 * r, len(feats)])
-        bg = rearrange(np.asarray(batch_patches[r][:, bg_idx]),
-                       '(h w) p1 p2 -> (h p1) (w p2)', h=n_h, w=n_w)
-        bg_cmap, bg_vmin, bg_vmax = _field_style(bg_name, bg)
-        ax.imshow(bg, extent=[0, W, H, 0], cmap=bg_cmap, vmin=bg_vmin, vmax=bg_vmax)
-        start = batch_index * batch_size * patches_per_image + r * patches_per_image
-        patch_labels = labels[start:start + patches_per_image]
-        assert patch_labels.size == n_h * n_w, \
-            f"expected {n_h * n_w} labels, got {patch_labels.size}"
+        bg_cmap, bg_vmin, bg_vmax = _field_style(channel_names[bg_idx], img[bg_idx])
+        ax.imshow(img[bg_idx], extent=[0, W, H, 0], cmap=bg_cmap, vmin=bg_vmin, vmax=bg_vmax)
+        patch_labels = labels[c * ppi:(c + 1) * ppi]
+        assert patch_labels.size == ppi, f"expected {ppi} labels, got {patch_labels.size}"
         ax.imshow(patch_labels.reshape(n_h, n_w), cmap=cmap, norm=norm, alpha=0.9,
                   extent=[0, W, H, 0], interpolation="nearest")
         for g in range(0, H + 1, patch_size):
@@ -263,10 +250,7 @@ def make_image_from_patches(cutouts_dataloader, patched_loader, labels, *,
             ax.set_title("clusters", fontsize=title_fontsize)
 
         cap = fig.add_subplot(gs[2 * r + 1, :]); cap.axis("off")
-        k = batch_index * batch_size + r
-        row = (metadata.loc[ids[k]]
-               if metadata is not None and ids is not None and ids[k] in metadata.index
-               else None)
+        row = metadata.loc[ids[c]] if ids[c] in metadata.index else None
         cap.text(0.01, 0.5, _format_meta(row, metadata_fields),
                  va="center", ha="left", fontsize=meta_fontsize, family="monospace")
 
@@ -275,38 +259,27 @@ def make_image_from_patches(cutouts_dataloader, patched_loader, labels, *,
     plt.show()
 
 
-def plot_global_cluster_maps(cutouts_dataloader, patched_loader, labels, *,
+def plot_global_cluster_maps(dataset, labels, *, patch_size=8,
                              cmap=None, alpha=0.5, point_size=8, extent=None,
                              coastlines=True, panel_size=8, drop_noise=False,
                              save_dir=None):
     """One global lon/lat map per timestamp; each patch is a dot colored by its
     cluster label (-1 noise shown grey).  Emits a separate figure per timestamp.
 
-    XC/YC (lon/lat) come from the patch coordinate channels (passed through
-    unnormalized by the loader); each patch's timestamp is its cutout's
-    ``time_snapshot``.  Pass the same ``cmap`` used elsewhere so colors match.
+    dataset  : CutoutDataset (provides per-patch lon/lat and timestamps).
+    Pass the same ``cmap`` used elsewhere so colors match.
 
     alpha    : dot opacity (dots may overlap).
     extent   : (lon_min, lon_max, lat_min, lat_max); default auto-fits all points,
                shared across timestamps.  Use (-180, 180, -90, 90) for the globe.
     save_dir : if given, save each figure as clusters_<timestamp>.png there.
     """
-    ds = getattr(cutouts_dataloader, "dataset", None)
-    channel_names, metadata, ids = ds.channel_names, ds.metadata, ds.ids
-    xc_i, yc_i = channel_names.index("XC"), channel_names.index("YC")
-
-    lons, lats, ppi = [], [], None
-    for batch in patched_loader:                       # (B, ppi, C, p, p)
-        ppi = batch.shape[1]
-        lons.append(np.asarray(batch[:, :, xc_i].mean(dim=(-1, -2))).reshape(-1))
-        lats.append(np.asarray(batch[:, :, yc_i].mean(dim=(-1, -2))).reshape(-1))
-    lon, lat = np.concatenate(lons), np.concatenate(lats)
+    lon, lat = dataset.get_patch_coords(patch_size)
+    ts = dataset.get_patch_times(patch_size)
 
     labels = np.asarray(labels)
     assert labels.size == lon.size, f"{labels.size} labels vs {lon.size} patches"
-    assert len(ids) * ppi == lon.size, "cutout ids and patches are misaligned"
 
-    ts = np.repeat(metadata["time_snapshot"].reindex(np.asarray(ids)).values, ppi)
     keep = ~np.isnat(ts)
     if drop_noise:
         keep &= labels >= 0

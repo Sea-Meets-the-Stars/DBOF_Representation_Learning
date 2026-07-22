@@ -5,7 +5,7 @@ from dask.distributed import Client
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torchvision.transforms import v2 as torchtransforms
+from einops import rearrange
 
 
 # Default cutout dataset location (v2 test data).
@@ -18,6 +18,12 @@ DEFAULT_DATASET_NAME = "cutout_dataset_creation.zarr"
 
 def _as_str(x):
     return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+
+
+def _to_patches(images, patch_size):
+    """(N, C, H, W) -> (N*ppi, C, p, p); patch order within a cutout is row-major."""
+    return rearrange(images, 'n c (h p1) (w p2) -> (n h w) c p1 p2',
+                     p1=patch_size, p2=patch_size)
 
 
 class CutoutDataSource:
@@ -50,159 +56,150 @@ class CutoutDataSource:
 
     def print_available_channels(self):
         """Print every channel in the source dataset, in stored order."""
-        channels_str = "["
         print(f"{len(self.channel_names)} available channels:")
-        for i, name in enumerate(self.channel_names):
-            channels_str += f"'{name}',"
-        channels_str = channels_str[:-1]
-        channels_str += "]"
-        print(channels_str)
+        print("[" + ",".join(f"'{n}'" for n in self.channel_names) + "]")
 
 
-class Cutouts(Dataset):
-    def __init__(self, X, ids, source, channel_names=None, transform=None):
-        """
-        X: array/tensor of shape [N, C, H, W]
-        ids: image_id per row, same order as X (so the two can be shuffled together)
-        source: CutoutDataSource, used to pull the metadata table once
-        channel_names: names of the C channels, in order
-        """
-        self.X = torch.as_tensor(X, dtype=torch.float32)
-        self.ids = [_as_str(i) for i in ids]        # parallel to X
-        self.channel_names = channel_names
-        self.metadata = source.read_metadata()      # full df, indexed by image_id
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, idx):
-        sample = self.X[idx]
-        if self.transform:
-            sample = self.transform(sample)
-
-        return sample
-
-
-def make_dataloader(X, ids, source, mean, std, channel_names=None,
-                    batch_size=64, num_workers=0, shuffle=False):
-    transforms = torchtransforms.Compose([
-        torchtransforms.Normalize(mean=mean, std=std)
-    ])
-
-    train_ds = Cutouts(X, ids, source, channel_names=channel_names, transform=transforms)
-    print(f"Channels : {train_ds.channel_names}")
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-
-    return train_loader
-
-def chunk_aware_subsample(da, num_sample_chunks, subsample_per_chunk, chunk = 1020):
+def chunk_aware_subsample(da, num_sample_chunks, subsample_per_chunk, chunk=1020):
     rng = np.random.default_rng()
-
     n = da.shape[0]
     n_chunks = (n + chunk - 1) // chunk
-
     sample_chunks = rng.choice(n_chunks, size=num_sample_chunks, replace=False)
-
-    # within each chosen chunk, pick r indices
 
     idx = []
     for c in sample_chunks:
         start = c * chunk
         stop = min((c + 1) * chunk, n)
         idx.append(rng.integers(start, stop, size=subsample_per_chunk))
-
-    idx = np.sort(np.concatenate(idx))
-    return idx
+    return np.sort(np.concatenate(idx))
 
 
-def download_data(source=None, subset=True, subsample_per_chunk=300, num_sample_chunks=30, n_workers=8):
+def _download(source, subset, subsample_per_chunk, num_sample_chunks, n_workers):
     client = Client(n_workers=n_workers)
     print(client)
     port = client.scheduler_info()["services"]["dashboard"]
-    # For nrp link is :
-    # https://jupyterhub-west.nrp-nautilus.io/hub/user-redirect/proxy/{port}/status
     print(f"nrp link url : https://jupyterhub-west.nrp-nautilus.io/hub/user-redirect/proxy/{port}/status")
 
-    source = source or CutoutDataSource()
     images_da, ids_da, valid_mask_da = source.full_dataset_as_dask()
 
     # drop empty store slots (rejected cutouts / failed steps)
     valid_idx = np.flatnonzero(np.asarray(valid_mask_da))
-    images_da = images_da[valid_idx]
-    ids_da = ids_da[valid_idx]
+    images_da, ids_da = images_da[valid_idx], ids_da[valid_idx]
 
     if subset:
-        N = len(images_da)
         subset_idxs = chunk_aware_subsample(images_da, num_sample_chunks, subsample_per_chunk)
-        images_da = images_da[subset_idxs]
-        ids_da = ids_da[subset_idxs]
+        images_da, ids_da = images_da[subset_idxs], ids_da[subset_idxs]
 
-    images_np = images_da.compute()
-    ids_np = np.asarray(ids_da.compute())      # already subset in lockstep with images
-
-    return images_np, ids_np
+    return images_da.compute(), np.asarray(ids_da.compute())   # aligned
 
 
-def filter_invalid_cutouts(images_np, ids_np, channel_names):
+def _filter_invalid(images_np, ids_np, channel_names):
     n_start = images_np.shape[0]
-
-    # Drop cutouts containing ANY sea ice (SIarea > 0 anywhere in the cutout).
     siarea = images_np[:, channel_names.index("SIarea")]      # (N, H, W)
     has_ice = (siarea > 0).any(axis=(1, 2))
-
-    # Drop cutouts containing any NaN (e.g. residual land leakage).
     has_nan = np.isnan(images_np).any(axis=(1, 2, 3))
-
     keep = ~(has_ice | has_nan)
     print(f"dropped {int(has_ice.sum())} ice, {int(has_nan.sum())} NaN; "
           f"kept {int(keep.sum())} / {n_start}")
     return images_np[keep], ids_np[keep]
 
 
-def select_channels(images_np, source_channels, data_channels, coord_channels):
-    """Reorder to [*data_channels, *coord_channels]; return (images, mean, std, order).
+def _split_channels(images_np, source_channels, data_channels, coord_channels):
+    """Split cutouts into RAW feature array + RAW coord array, and compute the
+    per-feature z-score stats.  Features and coords stay separate so coordinates
+    can never leak into the training/clustering data.
 
-    Data channels are z-scored. Coord channels (e.g. XC, YC) carry positional
-    info used downstream and are passed through unnormalized (mean 0, std 1).
+    X keeps exactly ``data_channels`` (may be any subset of the store's channels);
+    the full stack is read but only the requested channels are retained.
     """
-    order = list(data_channels) + list(coord_channels)
-    missing = [c for c in order if c not in source_channels]
+    missing = [c for c in list(data_channels) + list(coord_channels)
+               if c not in source_channels]
     if missing:
         raise ValueError(f"channels not in dataset: {missing}. available: {source_channels}")
 
-    idx = [source_channels.index(c) for c in order]
-    images_np = images_np[:, idx]
-
-    n_data = len(data_channels)
-    mean = images_np.mean(axis=(0, 2, 3)).astype("float32")
-    std = images_np.std(axis=(0, 2, 3)).astype("float32")
-    mean[n_data:] = 0.0     # leave coord channels unshifted
-    std[n_data:] = 1.0      # and unscaled
-    return images_np, torch.from_numpy(mean), torch.from_numpy(std), order
+    d_idx = [source_channels.index(c) for c in data_channels]
+    c_idx = [source_channels.index(c) for c in coord_channels]
+    X = images_np[:, d_idx]                        # (N, C_feat, H, W) raw — only requested channels
+    coords = images_np[:, c_idx]                   # (N, C_coord, H, W) raw
+    mean = X.mean(axis=(0, 2, 3)).astype("float32")
+    std = X.std(axis=(0, 2, 3)).astype("float32")
+    return X, coords, mean, std
 
 
-def get_cutout_loader(source=None, data_channels=None, coord_channels=("XC", "YC"),
-                      subset=True, subsample_per_chunk=300, num_sample_chunks=30,
-                      n_workers=8, batch_size=64):
-    source = source or CutoutDataSource()
-    if data_channels is None:
-        raise ValueError("pass data_channels; see source.print_available_channels()")
+class _CutoutTorch(Dataset):
+    """Thin torch Dataset over normalized feature images, for get_dataloader."""
+    def __init__(self, X, ids):
+        self.X = torch.as_tensor(X, dtype=torch.float32)
+        self.ids = ids                       # parallel to X; batched alongside it
 
-    images_np, ids_np = download_data(source=source, subset=subset, subsample_per_chunk=subsample_per_chunk,
-                                      num_sample_chunks=num_sample_chunks, n_workers=n_workers)
-    images_np, ids_np = filter_invalid_cutouts(images_np, ids_np, source.channel_names)
+    def __len__(self):
+        return len(self.X)
 
-    images_np, mean, std, channel_order = select_channels(
-        images_np, source.channel_names, data_channels, coord_channels)
+    def __getitem__(self, i):
+        return self.X[i], self.ids[i]
 
-    data_loader = make_dataloader(images_np, ids_np, source, mean, std,
-                                  channel_names=channel_order, batch_size=batch_size, num_workers=0)
-    return data_loader
+
+class CutoutDataset:
+    """In-memory cutout dataset: raw feature images X, separate raw coord fields,
+    ids, metadata, channel names.  Build with ``CutoutDataset.from_source(...)``.
+
+    X is kept raw; normalization (per-feature z-score) is applied on demand in
+    ``get_patches`` / ``get_dataloader``, so ``make_image_from_patches`` can show
+    physical values.
+    """
+
+    def __init__(self, X, coords, ids, metadata, channel_names, coord_names, mean, std):
+        self.X = X                        # (N, C_feat, H, W) raw features
+        self.coords = coords              # (N, C_coord, H, W) raw XC/YC
+        self.ids = ids                    # decoded image_id per row, parallel to X
+        self.metadata = metadata          # full df, indexed by image_id
+        self.channel_names = channel_names   # feature names (no XC/YC)
+        self.coord_names = coord_names       # e.g. ["XC", "YC"]
+        self.mean, self.std = mean, std      # per-feature z-score stats (C_feat,)
+
+    @classmethod
+    def from_source(cls, source=None, data_channels=None, coord_channels=("XC", "YC"),
+                    subset=True, subsample_per_chunk=300, num_sample_chunks=30, n_workers=8):
+        source = source or CutoutDataSource()
+        if data_channels is None:
+            raise ValueError("pass data_channels; see source.print_available_channels()")
+
+        images, ids = _download(source, subset, subsample_per_chunk, num_sample_chunks, n_workers)
+        images, ids = _filter_invalid(images, ids, source.channel_names)
+        X, coords, mean, std = _split_channels(
+            images, source.channel_names, data_channels, coord_channels)
+        print(f"features {list(data_channels)} | coords {list(coord_channels)}")
+        return cls(X, coords, [_as_str(i) for i in ids], source.read_metadata(),
+                   list(data_channels), list(coord_channels), mean, std)
+
+    def __len__(self):
+        return len(self.X)
+
+    def _normalized(self):
+        return (self.X - self.mean[:, None, None]) / self.std[:, None, None]
+
+    def get_patches(self, patch_size, flatten=True):
+        """Normalized feature patches for clustering.
+        flatten=True  -> (N_patches, C_feat*p*p) ndarray (clustering-ready)
+        flatten=False -> (N_patches, C_feat, p, p) ndarray
+        """
+        p = _to_patches(self._normalized(), patch_size)
+        return p.reshape(p.shape[0], -1) if flatten else p
+
+    def get_patch_coords(self, patch_size):
+        """Per-patch center (lon, lat), aligned with get_patches order."""
+        c = _to_patches(self.coords, patch_size)
+        xc, yc = self.coord_names.index("XC"), self.coord_names.index("YC")
+        return c[:, xc].mean(axis=(-1, -2)), c[:, yc].mean(axis=(-1, -2))
+
+    def get_patch_times(self, patch_size):
+        """Per-patch timestamp (its cutout's), aligned with get_patches order."""
+        H, W = self.X.shape[2], self.X.shape[3]
+        ppi = (H // patch_size) * (W // patch_size)
+        return np.repeat(self.metadata["time_snapshot"].reindex(self.ids).values, ppi)
+
+    def get_dataloader(self, batch_size=64, shuffle=False, num_workers=0):
+        """torch DataLoader yielding (normalized feature images, ids) per batch.
+        ids let you associate metadata (dataset.metadata.loc[ids]) during training."""
+        return DataLoader(_CutoutTorch(self._normalized(), self.ids), batch_size=batch_size,
+                          shuffle=shuffle, num_workers=num_workers, pin_memory=True)
