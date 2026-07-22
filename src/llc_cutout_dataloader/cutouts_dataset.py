@@ -1,4 +1,5 @@
 import dbof.cutout_dataset_creation.zarr_dataset as zarr_dataset
+import dbof.cutout_dataset_creation.metadata as metadata_mod
 import dbof.io.filesystems as filesystems
 from dask.distributed import Client
 import numpy as np
@@ -15,6 +16,10 @@ DEFAULT_RUN_ID = "itest_d7af6005"
 DEFAULT_DATASET_NAME = "cutout_dataset_creation.zarr"
 
 
+def _as_str(x):
+    return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+
+
 class CutoutDataSource:
     """Access to a generated DBOF cutout dataset on S3.
 
@@ -25,6 +30,7 @@ class CutoutDataSource:
     def __init__(self, bucket=DEFAULT_BUCKET, folder=DEFAULT_FOLDER,
                  run_id=DEFAULT_RUN_ID, dataset_name=DEFAULT_DATASET_NAME,
                  s3_endpoint=DEFAULT_S3_ENDPOINT):
+        self.bucket, self.folder, self.run_id = bucket, folder, run_id
         self.fs, self.fs_synch = filesystems.create_s3_filesystems(s3_endpoint)
         self.reader = zarr_dataset.ZarrDatasetReader(
             bucket=bucket, folder=folder, run_id=run_id,
@@ -34,6 +40,13 @@ class CutoutDataSource:
 
     def full_dataset_as_dask(self):
         return self.reader.full_dataset_as_dask()
+
+    def read_metadata(self):
+        """Full per-cutout metadata table (parquet), indexed by image_id."""
+        reader = metadata_mod.create_metadata_reader(
+            self.bucket, self.folder, self.run_id, self.fs_synch)
+        df = reader.read()
+        return df.set_index(df["image_id"].map(_as_str))
 
     def print_available_channels(self):
         """Print every channel in the source dataset, in stored order."""
@@ -47,13 +60,17 @@ class CutoutDataSource:
 
 
 class Cutouts(Dataset):
-    def __init__(self, X, channel_names=None, transform=None):
+    def __init__(self, X, ids, source, channel_names=None, transform=None):
         """
         X: array/tensor of shape [N, C, H, W]
+        ids: image_id per row, same order as X (so the two can be shuffled together)
+        source: CutoutDataSource, used to pull the metadata table once
         channel_names: names of the C channels, in order
         """
         self.X = torch.as_tensor(X, dtype=torch.float32)
+        self.ids = [_as_str(i) for i in ids]        # parallel to X
         self.channel_names = channel_names
+        self.metadata = source.read_metadata()      # full df, indexed by image_id
         self.transform = transform
 
     def __len__(self):
@@ -67,12 +84,13 @@ class Cutouts(Dataset):
         return sample
 
 
-def make_dataloader(X, mean, std, channel_names=None, batch_size=64, num_workers=0, shuffle=False):
+def make_dataloader(X, ids, source, mean, std, channel_names=None,
+                    batch_size=64, num_workers=0, shuffle=False):
     transforms = torchtransforms.Compose([
         torchtransforms.Normalize(mean=mean, std=std)
     ])
 
-    train_ds = Cutouts(X, channel_names=channel_names, transform=transforms)
+    train_ds = Cutouts(X, ids, source, channel_names=channel_names, transform=transforms)
     print(f"Channels : {train_ds.channel_names}")
 
     train_loader = DataLoader(
@@ -128,31 +146,25 @@ def download_data(source=None, subset=True, subsample_per_chunk=300, num_sample_
         ids_da = ids_da[subset_idxs]
 
     images_np = images_da.compute()
+    ids_np = np.asarray(ids_da.compute())      # already subset in lockstep with images
 
-    return images_np
-
-
-def filter_based_on_mask(data, bad_mask):
-    """Keep rows where bad_mask is False."""
-    return data[~bad_mask]
+    return images_np, ids_np
 
 
-def filter_invalid_cutouts(images_np, channel_names):
+def filter_invalid_cutouts(images_np, ids_np, channel_names):
     n_start = images_np.shape[0]
 
     # Drop cutouts containing ANY sea ice (SIarea > 0 anywhere in the cutout).
     siarea = images_np[:, channel_names.index("SIarea")]      # (N, H, W)
     has_ice = (siarea > 0).any(axis=(1, 2))
-    images_np = filter_based_on_mask(images_np, has_ice)
-    print(f"dropped {int(has_ice.sum())} cutouts with sea ice")
 
     # Drop cutouts containing any NaN (e.g. residual land leakage).
     has_nan = np.isnan(images_np).any(axis=(1, 2, 3))
-    images_np = filter_based_on_mask(images_np, has_nan)
-    print(f"dropped {int(has_nan.sum())} cutouts with NaN")
 
-    print(f"kept {images_np.shape[0]} / {n_start} cutouts")
-    return images_np
+    keep = ~(has_ice | has_nan)
+    print(f"dropped {int(has_ice.sum())} ice, {int(has_nan.sum())} NaN; "
+          f"kept {int(keep.sum())} / {n_start}")
+    return images_np[keep], ids_np[keep]
 
 
 def select_channels(images_np, source_channels, data_channels, coord_channels):
@@ -184,13 +196,13 @@ def get_cutout_loader(source=None, data_channels=None, coord_channels=("XC", "YC
     if data_channels is None:
         raise ValueError("pass data_channels; see source.print_available_channels()")
 
-    images_np = download_data(source=source, subset=subset, subsample_per_chunk=subsample_per_chunk,
-                              num_sample_chunks=num_sample_chunks, n_workers=n_workers)
-    images_np = filter_invalid_cutouts(images_np, source.channel_names)
+    images_np, ids_np = download_data(source=source, subset=subset, subsample_per_chunk=subsample_per_chunk,
+                                      num_sample_chunks=num_sample_chunks, n_workers=n_workers)
+    images_np, ids_np = filter_invalid_cutouts(images_np, ids_np, source.channel_names)
 
     images_np, mean, std, channel_order = select_channels(
         images_np, source.channel_names, data_channels, coord_channels)
 
-    data_loader = make_dataloader(images_np, mean, std, channel_names=channel_order,
-                                  batch_size=batch_size, num_workers=0)
+    data_loader = make_dataloader(images_np, ids_np, source, mean, std,
+                                  channel_names=channel_order, batch_size=batch_size, num_workers=0)
     return data_loader
