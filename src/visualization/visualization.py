@@ -6,6 +6,7 @@ import cartopy.feature as cfeature
 import cmocean
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 from matplotlib.colors import BoundaryNorm, ListedColormap
 
 from dbof.plotting.field_cmaps import load_field_cmaps
@@ -311,3 +312,135 @@ def plot_global_cluster_maps(dataset, labels, *, patch_size=8,
             fig.savefig(os.path.join(save_dir, f"clusters_{np.datetime64(t, 's')}.png"),
                         dpi=150, bbox_inches="tight")
         plt.show()
+
+
+def _field_label(name):
+    """Physical label from the llc4320 registry, falling back to the raw name."""
+    spec = _FIELD_CMAPS.get(name)
+    return spec[1] if spec else name
+
+
+def _binned_trend(x, y, nbins):
+    """(centers, median) of y binned over x; NaN for empty bins."""
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    if x.size == 0:
+        return np.array([]), np.array([])
+    edges = np.linspace(x.min(), x.max(), nbins + 1)
+    b = np.clip(np.digitize(x, edges) - 1, 0, nbins - 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    med = np.array([np.median(y[b == i]) if np.any(b == i) else np.nan
+                    for i in range(nbins)])
+    return centers, med
+
+
+def field_eda(dataset, field, *, bins=200, log=False, sample_pixels=1_000_000,
+              trend_bins=40, panel_size=4, point_size=6, alpha=0.3, rng=None):
+    """Four-panel EDA for one field: pixel PDF, then per-cutout mean vs latitude,
+    longitude and time (centres/time come from dataset.metadata, by id).
+
+    dataset : CutoutDataset (raw X, channel_names, ids, metadata).
+    field   : channel name, e.g. 'Theta'.
+    """
+    rng = rng or np.random.default_rng(0)
+    ci = dataset.channel_names.index(field)
+    X = dataset.X[:, ci]                                   # (N, H, W) raw
+    label = _field_label(field)
+
+    # pixel PDF (subsampled for speed)
+    flat = X.reshape(-1)
+    if sample_pixels and flat.size > sample_pixels:
+        flat = flat[rng.choice(flat.size, size=sample_pixels, replace=False)]
+    flat = flat[np.isfinite(flat)]
+
+    # per-cutout means, and metadata aligned to X rows by id
+    means = np.nanmean(X, axis=(1, 2))
+    meta = dataset.metadata.reindex(dataset.ids)
+    lat = meta["center_lat"].to_numpy(dtype=float)
+    lon = meta["center_lon"].to_numpy(dtype=float)
+    t   = meta["time_snapshot"].to_numpy()
+
+    fig, axes = plt.subplots(1, 4, figsize=(panel_size * 4, panel_size))
+
+    axes[0].hist(flat, bins=bins, density=True, log=log)
+    axes[0].set_xlabel(label); axes[0].set_ylabel("PDF")
+    axes[0].set_title(f"{field} pixel PDF  (n={flat.size:,})")
+
+    for ax, v, name in ((axes[1], lat, "latitude"), (axes[2], lon, "longitude")):
+        ax.scatter(v, means, s=point_size, alpha=alpha, linewidths=0)
+        c, m = _binned_trend(v, means, trend_bins)
+        ax.plot(c, m, color="red", lw=2)
+        ax.set_xlabel(f"center {name}"); ax.set_ylabel("cutout mean")
+        ax.set_title(f"{field} by {name}")
+
+    axes[3].scatter(t, means, s=point_size, alpha=alpha, linewidths=0)
+    uniq = np.unique(t[~pd.isna(t)])
+    if uniq.size:
+        axes[3].plot(uniq, [np.nanmean(means[t == u]) for u in uniq], color="red", lw=2)
+    axes[3].set_xlabel("time"); axes[3].set_ylabel("cutout mean")
+    axes[3].set_title(f"{field} by time")
+
+    fig.autofmt_xdate()
+    fig.suptitle(label)
+    fig.tight_layout()
+    plt.show()
+
+
+def channel_correlation(dataset, *, sample_pixels=500_000, annot=True,
+                        figsize=(12, 10), rng=None):
+    """Channel x channel Pearson correlation over randomly sampled pixels.
+    Samples (cutout, row, col) triples so the full stack is never materialized."""
+    rng = rng or np.random.default_rng(0)
+    N, C, H, W = dataset.X.shape
+    n = rng.integers(0, N, sample_pixels)
+    h = rng.integers(0, H, sample_pixels)
+    w = rng.integers(0, W, sample_pixels)
+    corr = pd.DataFrame(dataset.X[n, :, h, w],              # (sample_pixels, C)
+                        columns=dataset.channel_names).corr()
+
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(corr.to_numpy(), cmap="coolwarm", vmin=-1, vmax=1)
+    ax.set_xticks(range(C)); ax.set_xticklabels(dataset.channel_names, rotation=90)
+    ax.set_yticks(range(C)); ax.set_yticklabels(dataset.channel_names)
+    if annot:
+        for i in range(C):
+            for j in range(C):
+                ax.text(j, i, f"{corr.iat[i, j]:.2f}", ha="center", va="center", fontsize=7)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02, label="Pearson r")
+    ax.set_title(f"channel correlation  (n={sample_pixels:,} pixels)")
+    fig.tight_layout()
+    plt.show()
+    return corr
+
+
+def plot_sample_map(dataset, *, density=True, point_size=4, alpha=0.05,
+                    gridsize=60, figsize=(14, 5)):
+    """Where the cutouts were drawn: scatter of centres plus a hexbin density
+    map, to expose geographic sampling bias."""
+    meta = dataset.metadata.reindex(dataset.ids)
+    lat = meta["center_lat"].to_numpy(dtype=float)
+    lon = meta["center_lon"].to_numpy(dtype=float)
+    ok = np.isfinite(lat) & np.isfinite(lon)
+    lat, lon = lat[ok], lon[ok]
+
+    proj = ccrs.PlateCarree()
+    ncol = 2 if density else 1
+    fig, axes = plt.subplots(1, ncol, figsize=figsize, squeeze=False,
+                             subplot_kw={"projection": proj})
+
+    ax = axes[0][0]
+    ax.set_global(); ax.add_feature(cfeature.LAND, facecolor="0.92", zorder=0)
+    ax.coastlines(linewidth=0.5, zorder=1)
+    ax.scatter(lon, lat, s=point_size, alpha=alpha, transform=proj, zorder=2)
+    ax.set_title(f"cutout centres (n={lat.size:,})")
+
+    if density:
+        ax2 = axes[0][1]
+        ax2.set_global(); ax2.coastlines(linewidth=0.5)
+        hb = ax2.hexbin(lon, lat, gridsize=gridsize, mincnt=1, cmap="magma",
+                        transform=proj, extent=(-180, 180, -90, 90))
+        fig.colorbar(hb, ax=ax2, fraction=0.025, pad=0.02, label="cutouts / cell")
+        ax2.set_title("sampling density")
+
+    fig.tight_layout()
+    plt.show()
