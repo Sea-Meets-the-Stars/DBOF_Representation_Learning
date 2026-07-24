@@ -26,6 +26,16 @@ def _to_patches(images, patch_size):
                      p1=patch_size, p2=patch_size)
 
 
+_GRAD_PREFIX = "grad"      # grad-magnitude channels (gradb2, gradrho2, ...) are log-scaled
+
+
+def _safe_log10(a):
+    """log10 with a positive floor so exact-zero gradients don't produce -inf."""
+    pos = a[a > 0]
+    floor = float(pos.min()) if pos.size else 1.0
+    return np.log10(np.maximum(a, floor))
+
+
 class CutoutDataSource:
     """Access to a generated DBOF cutout dataset on S3.
 
@@ -175,15 +185,39 @@ class CutoutDataset:
     def __len__(self):
         return len(self.X)
 
-    def _normalized(self):
-        return (self.X - self.mean[:, None, None]) / self.std[:, None, None]
+    def _normalized(self, X=None):
+        """Per-feature z-score.  Operates on the given array (default self.X) and
+        computes the stats from it, so it composes after other transforms
+        (e.g. after log-scaling the gradient fields)."""
+        X = self.X if X is None else X
+        mean = X.mean(axis=(0, 2, 3), keepdims=True)
+        std = X.std(axis=(0, 2, 3), keepdims=True)
+        return (X - mean) / std
 
-    def get_patches(self, patch_size, flatten=True):
-        """Normalized feature patches for clustering.
+    def _log_gradients(self, X=None):
+        """log10 the grad-magnitude channels (name starts with 'grad'); other
+        channels pass through unchanged.  Returns a copy."""
+        X = (self.X if X is None else X).astype("float32", copy=True)
+        for i, c in enumerate(self.channel_names):
+            if c.startswith(_GRAD_PREFIX):
+                X[:, i] = _safe_log10(X[:, i])
+        return X
+
+    def preprocess_for_training(self, X=None):
+        """Full training transform: log-scale the gradient fields, then z-score.
+        Order matters -- the z-score stats are computed on the logged data."""
+        X = self.X if X is None else X
+        return self._normalized(self._log_gradients(X))
+
+    def get_patches(self, patch_size, flatten=True, preproc=True):
+        """Feature patches for clustering.
+        preproc=True (default) applies preprocess_for_training (log grads + z-score);
+        preproc=False uses the raw stored X.
         flatten=True  -> (N_patches, C_feat*p*p) ndarray (clustering-ready)
         flatten=False -> (N_patches, C_feat, p, p) ndarray
         """
-        p = _to_patches(self._normalized(), patch_size)
+        X = self.preprocess_for_training() if preproc else self.X
+        p = _to_patches(X, patch_size)
         return p.reshape(p.shape[0], -1) if flatten else p
 
     def get_patch_coords(self, patch_size):
@@ -198,8 +232,10 @@ class CutoutDataset:
         ppi = (H // patch_size) * (W // patch_size)
         return np.repeat(self.metadata["time_snapshot"].reindex(self.ids).values, ppi)
 
-    def get_dataloader(self, batch_size=64, shuffle=False, num_workers=0):
-        """torch DataLoader yielding (normalized feature images, ids) per batch.
-        ids let you associate metadata (dataset.metadata.loc[ids]) during training."""
-        return DataLoader(_CutoutTorch(self._normalized(), self.ids), batch_size=batch_size,
+    def get_dataloader(self, batch_size=64, shuffle=False, num_workers=0, preproc=True):
+        """torch DataLoader yielding (feature images, ids) per batch.  preproc=True
+        applies preprocess_for_training (same transform as get_patches); ids let you
+        associate metadata (dataset.metadata.loc[ids]) during training."""
+        X = self.preprocess_for_training() if preproc else self.X
+        return DataLoader(_CutoutTorch(X, self.ids), batch_size=batch_size,
                           shuffle=shuffle, num_workers=num_workers, pin_memory=True)
