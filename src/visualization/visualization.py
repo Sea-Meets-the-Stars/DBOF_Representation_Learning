@@ -335,7 +335,7 @@ def _binned_trend(x, y, nbins):
 
 
 def field_eda(dataset, field, *, bins=200, log=False, sample_pixels=1_000_000,
-              trend_bins=40, panel_size=4, point_size=6, alpha=0.3, rng=None):
+              trend_bins=40, panel_size=4, point_size=6, alpha=0.3, rng=None, preprocess=False):
     """Four-panel EDA for one field: pixel PDF, then per-cutout mean vs latitude,
     longitude and time (centres/time come from dataset.metadata, by id).
 
@@ -344,7 +344,10 @@ def field_eda(dataset, field, *, bins=200, log=False, sample_pixels=1_000_000,
     """
     rng = rng or np.random.default_rng(0)
     ci = dataset.channel_names.index(field)
-    X = dataset.X[:, ci]                                   # (N, H, W) raw
+    if preprocess:
+        X = dataset.preprocess()[:, ci]
+    else:
+        X = dataset.X[:, ci]                                   # (N, H, W) raw
     label = _field_label(field)
 
     # pixel PDF (subsampled for speed)
