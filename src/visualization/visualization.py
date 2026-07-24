@@ -345,7 +345,7 @@ def field_eda(dataset, field, *, bins=200, log=False, sample_pixels=1_000_000,
     rng = rng or np.random.default_rng(0)
     ci = dataset.channel_names.index(field)
     if preprocess:
-        X = dataset.preprocess()[:, ci]
+        X = dataset.preprocess_for_training()[:, ci]
     else:
         X = dataset.X[:, ci]                                   # (N, H, W) raw
     label = _field_label(field)
