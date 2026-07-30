@@ -20,7 +20,7 @@ urls = { "Homepage" = "https://github.com/AI-for-Ocean-Science/" }
 requires-python = ">=3.12"
 
 dependencies = [
-    "dbof-in-native-grid @ git+https://github.com/Sea-Meets-the-Stars/llc4320-native-grid-preprocessing.git@cutouts_data_v2", # todo update to main when ready
+    "dbof-in-native-grid @ git+https://github.com/Sea-Meets-the-Stars/llc4320-native-grid-preprocessing.git@main",
     "numpy",
     "torch==2.8.0",
     "torchvision",

@@ -184,7 +184,31 @@ def _format_meta(row, fields):
     return "     ".join(parts)
 
 
-def make_image_from_patches(dataset, labels, *,
+_ENTROPY_CMAP = "viridis"
+
+
+def _patch_overlay(ax, bg, bg_style, values, patch_size, *,
+                   cmap, norm=None, vmin=None, vmax=None):
+    """Field background with one value per patch drawn over the patch grid.
+
+    bg_style : (cmap, vmin, vmax) for the background, from _field_style.
+    values   : flat per-patch array for this cutout, row-major.
+    """
+    H, W = bg.shape
+    bg_cmap, bg_vmin, bg_vmax = bg_style
+    ax.imshow(bg, extent=[0, W, H, 0], cmap=bg_cmap, vmin=bg_vmin, vmax=bg_vmax)
+    im = ax.imshow(values.reshape(H // patch_size, W // patch_size),
+                   cmap=cmap, norm=norm, vmin=vmin, vmax=vmax, alpha=0.9,
+                   extent=[0, W, H, 0], interpolation="nearest")
+    for g in range(0, H + 1, patch_size):
+        ax.axhline(g, color="k", lw=0.8, alpha=0.6)
+    for g in range(0, W + 1, patch_size):
+        ax.axvline(g, color="k", lw=0.8, alpha=0.6)
+    ax.set_xticks([]); ax.set_yticks([])
+    return im
+
+
+def make_image_from_patches(dataset, labels, *, entropy=None,
                             features=None, label_overlay_on=0,
                             patch_size=8, start=0, number_rows=6,
                             metadata_fields=_DEFAULT_META_FIELDS,
@@ -195,12 +219,16 @@ def make_image_from_patches(dataset, labels, *,
     overlay, and a metadata caption under each row.
 
     dataset          : CutoutDataset (provides raw X, channel_names, ids, metadata).
+    entropy          : optional per-patch ensemble entropy (NEMI.entropy, normalized
+                       to [0, 1]); adds a panel beside the cluster labels, on a
+                       fixed [0, 1] scale so rows and figures are comparable.
     features         : channel names/indices to show (default: all features).
     label_overlay_on : channel name/index used as the overlay background.
     start            : index of the first cutout to show.
     save_path        : if given, save the figure there before showing.
 
-    ``labels`` are flat per-patch in dataset order (patch k -> cutout k // ppi).
+    ``labels`` (and ``entropy``) are flat per-patch in dataset order
+    (patch k -> cutout k // ppi).
     """
     channel_names = dataset.channel_names
     imgs, metadata, ids = dataset.X, dataset.metadata, dataset.ids
@@ -218,14 +246,21 @@ def make_image_from_patches(dataset, labels, *,
     labels = np.asarray(labels)
     cmap, norm = _cluster_cmap_norm(labels, cmap)   # grey slot for -1 noise
 
-    n_col = len(feats) + 1
+    if entropy is not None:
+        entropy = np.asarray(entropy)
+        assert entropy.size == labels.size, \
+            f"{entropy.size} entropy values vs {labels.size} labels"
+
+    n_col = len(feats) + 1 + (1 if entropy is not None else 0)
     fig = plt.figure(figsize=(panel_size * n_col, panel_size * 1.4 * number_rows))
     gs = fig.add_gridspec(number_rows * 2, n_col,
                           height_ratios=[6, 2] * number_rows, hspace=0.06, wspace=0.05)
+    entropy_axes = []
 
     for r in range(number_rows):
         c = start + r
         img = np.asarray(imgs[c])
+        sl = slice(c * ppi, (c + 1) * ppi)
 
         for col, (idx, name) in enumerate(feats):
             ax = fig.add_subplot(gs[2 * r, col])
@@ -235,25 +270,31 @@ def make_image_from_patches(dataset, labels, *,
             if r == 0:
                 ax.set_title(name, fontsize=title_fontsize)
 
+        bg_style = _field_style(channel_names[bg_idx], img[bg_idx])
+
         ax = fig.add_subplot(gs[2 * r, len(feats)])
-        bg_cmap, bg_vmin, bg_vmax = _field_style(channel_names[bg_idx], img[bg_idx])
-        ax.imshow(img[bg_idx], extent=[0, W, H, 0], cmap=bg_cmap, vmin=bg_vmin, vmax=bg_vmax)
-        patch_labels = labels[c * ppi:(c + 1) * ppi]
+        patch_labels = labels[sl]
         assert patch_labels.size == ppi, f"expected {ppi} labels, got {patch_labels.size}"
-        ax.imshow(patch_labels.reshape(n_h, n_w), cmap=cmap, norm=norm, alpha=0.9,
-                  extent=[0, W, H, 0], interpolation="nearest")
-        for g in range(0, H + 1, patch_size):
-            ax.axhline(g, color="k", lw=0.8, alpha=0.6)
-        for g in range(0, W + 1, patch_size):
-            ax.axvline(g, color="k", lw=0.8, alpha=0.6)
-        ax.set_xticks([]); ax.set_yticks([])
+        _patch_overlay(ax, img[bg_idx], bg_style, patch_labels, patch_size,
+                       cmap=cmap, norm=norm)
         if r == 0:
             ax.set_title("clusters", fontsize=title_fontsize)
+
+        if entropy is not None:
+            ax = fig.add_subplot(gs[2 * r, len(feats) + 1])
+            ent_im = _patch_overlay(ax, img[bg_idx], bg_style, entropy[sl], patch_size,
+                                    cmap=_ENTROPY_CMAP, vmin=0.0, vmax=1.0)
+            entropy_axes.append(ax)
+            if r == 0:
+                ax.set_title("entropy", fontsize=title_fontsize)
 
         cap = fig.add_subplot(gs[2 * r + 1, :]); cap.axis("off")
         row = metadata.loc[ids[c]] if ids[c] in metadata.index else None
         cap.text(0.01, 0.5, _format_meta(row, metadata_fields),
                  va="center", ha="left", fontsize=meta_fontsize, family="monospace")
+
+    if entropy_axes:
+        fig.colorbar(ent_im, ax=entropy_axes, fraction=0.046, pad=0.02, label="entropy")
 
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
