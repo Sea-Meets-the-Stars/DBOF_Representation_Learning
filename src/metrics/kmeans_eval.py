@@ -35,7 +35,8 @@ def silhouette(X, labels, sample_size=10_000, seed=0):
 
     The exact score is O(n^2) in time, so above ``sample_size`` samples it is
     computed on a random subsample of X and labels together; ``sample_size=None``
-    uses every sample.
+    uses every sample.  Returns NaN when fewer than 2 clusters are present, where
+    the coefficient is undefined.
     """
     X, labels = np.asarray(X), np.asarray(labels)
     n = len(X)
@@ -43,4 +44,6 @@ def silhouette(X, labels, sample_size=10_000, seed=0):
         idx = np.random.default_rng(seed).choice(n, size=sample_size, replace=False)
         X, labels = X[idx], labels[idx]
     print(f"silhouette on {len(X):,} / {n:,} samples")
+    if len(np.unique(labels)) < 2:
+        return float("nan")
     return float(silhouette_score(X, labels))
