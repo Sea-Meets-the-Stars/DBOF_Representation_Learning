@@ -5,7 +5,7 @@ from dask.distributed import Client
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from einops import rearrange
+from einops import rearrange, reduce
 
 
 # Default cutout dataset location (v2 test data).
@@ -219,6 +219,15 @@ class CutoutDataset:
         X = self.preprocess_for_training() if preproc else self.X
         p = _to_patches(X, patch_size)
         return p.reshape(p.shape[0], -1) if flatten else p
+
+    def get_patch_features(self, patch_size, preproc=False):
+        """Per-patch mean of each feature channel, (N_patches, C_feat), aligned
+        with get_patches order.  preproc=False keeps physical units; preproc=True
+        applies the training transform.  Reduces straight from X, so the full
+        patch stack is never materialized."""
+        X = self.preprocess_for_training() if preproc else self.X
+        return reduce(X, 'n c (h p1) (w p2) -> (n h w) c', 'mean',
+                      p1=patch_size, p2=patch_size)
 
     def get_patch_coords(self, patch_size):
         """Per-patch center (lon, lat), aligned with get_patches order."""

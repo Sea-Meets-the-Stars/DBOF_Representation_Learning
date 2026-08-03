@@ -21,8 +21,7 @@ def nearest_neighbors(embeddings, k=10):
 
 def patch_descriptors(dataset, patch_size):
     """Per-patch physical descriptors (raw per-channel means) + (lon, lat), in get_patches order."""
-    patches = dataset.get_patches(patch_size=patch_size, flatten=False, preproc=False)  # (Np, C, p, p)
-    desc = patches.mean(axis=(2, 3))                                                     # (Np, C)
+    desc = dataset.get_patch_features(patch_size)                                        # (Np, C)
     lon, lat = dataset.get_patch_coords(patch_size)
     return desc, lon, lat, dataset.channel_names
 

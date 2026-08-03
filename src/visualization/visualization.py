@@ -140,6 +140,42 @@ def _cluster_cmap_norm(labels, cmap=None):
     return out, BoundaryNorm(bounds, len(colors))
 
 
+def _as_int_labels(labels):
+    """Cluster labels as ints, with NaN noise (single-member NEMI) folded into -1,
+    so -1 and NaN noise are one cluster everywhere downstream."""
+    return np.nan_to_num(np.asarray(labels, dtype=float), nan=-1.0).astype(int)
+
+
+def _cluster_order(labels, drop_noise=False):
+    """(ids, counts, fractions) per cluster, ordered by descending size.  Noise
+    (-1) is a cluster like any other unless drop_noise; fractions are of the
+    retained labels, so they always sum to 1."""
+    labels = _as_int_labels(labels)
+    if drop_noise:
+        labels = labels[labels >= 0]
+    ids, counts = np.unique(labels, return_counts=True)
+    order = np.argsort(-counts, kind="stable")     # ties keep ascending id
+    ids, counts = ids[order], counts[order]
+    return ids, counts, counts / counts.sum()
+
+
+def _select_clusters(labels, top_n=None, n_clusters=20, drop_noise=False, seed=0):
+    """Clusters to plot, as (ids, counts, percent).
+
+    top_n given -> the largest n, size-ordered.  Otherwise n_clusters drawn at
+    random from every cluster present (so small clusters are represented too)
+    and returned in ascending label order.
+    """
+    ids, counts, frac = _cluster_order(labels, drop_noise)
+    if top_n is not None:
+        keep = np.arange(min(top_n, ids.size))
+    else:
+        keep = np.random.default_rng(seed).choice(
+            ids.size, size=min(n_clusters, ids.size), replace=False)
+        keep = keep[np.argsort(ids[keep])]
+    return ids[keep], counts[keep], 100 * frac[keep]
+
+
 def _resolve_features(features, channel_names):
     """None -> all channels; else list of names/indices -> [(idx, name), ...]."""
     if features is None:
@@ -165,6 +201,12 @@ def _field_style(name, data):
         return cmap, -m, m
     lo, hi = np.percentile(finite, [1, 99])
     return cmap, float(lo), float(hi)
+
+
+def _field_label(name):
+    """Physical label from the llc4320 registry, falling back to the raw name."""
+    spec = _FIELD_CMAPS.get(name)
+    return spec[1] if spec else name
 
 
 def _format_meta(row, fields):
@@ -301,6 +343,27 @@ def make_image_from_patches(dataset, labels, *, entropy=None,
     plt.show()
 
 
+_PROJ = ccrs.PlateCarree()
+
+
+def _global_ax(fig, subplot, extent=None, coastlines=True, draw_labels=False):
+    """Lon/lat cartopy axis with land, coastlines and gridlines.
+
+    subplot : (nrows, ncols, index) passed to fig.add_subplot.
+    extent  : (lon_min, lon_max, lat_min, lat_max); None frames the whole globe.
+    """
+    ax = fig.add_subplot(*subplot, projection=_PROJ)
+    if extent is None:
+        ax.set_global()
+    else:
+        ax.set_extent(extent, crs=_PROJ)
+    if coastlines:
+        ax.add_feature(cfeature.LAND, facecolor="0.92", zorder=0)
+        ax.coastlines(linewidth=0.5, zorder=1)
+    ax.gridlines(draw_labels=draw_labels, linewidth=0.3, alpha=0.5)
+    return ax
+
+
 def plot_global_cluster_maps(dataset, labels, *, patch_size=8,
                              cmap=None, alpha=0.5, point_size=8, extent=None,
                              coastlines=True, panel_size=8, drop_noise=False,
@@ -319,7 +382,7 @@ def plot_global_cluster_maps(dataset, labels, *, patch_size=8,
     lon, lat = dataset.get_patch_coords(patch_size)
     ts = dataset.get_patch_times(patch_size)
 
-    labels = np.asarray(labels)
+    labels = _as_int_labels(labels)
     assert labels.size == lon.size, f"{labels.size} labels vs {lon.size} patches"
 
     keep = ~np.isnat(ts)
@@ -332,19 +395,13 @@ def plot_global_cluster_maps(dataset, labels, *, patch_size=8,
         m = 2.0
         extent = (lon.min() - m, lon.max() + m, lat.min() - m, lat.max() + m)
     ticks = np.arange(int(labels.min()), int(labels.max()) + 1)
-    proj = ccrs.PlateCarree()
 
     for t in np.unique(ts):
         msk = ts == t
         fig = plt.figure(figsize=(panel_size, panel_size * 0.55))
-        ax = fig.add_subplot(1, 1, 1, projection=proj)
-        ax.set_extent(extent, crs=proj)
-        if coastlines:
-            ax.add_feature(cfeature.LAND, facecolor="0.92", zorder=0)
-            ax.coastlines(linewidth=0.5, zorder=1)
-        ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
+        ax = _global_ax(fig, (1, 1, 1), extent, coastlines, draw_labels=True)
         sc = ax.scatter(lon[msk], lat[msk], c=labels[msk], cmap=cmap_d, norm=norm,
-                        s=point_size, alpha=alpha, linewidths=0, transform=proj, zorder=2)
+                        s=point_size, alpha=alpha, linewidths=0, transform=_PROJ, zorder=2)
         ax.set_title(str(np.datetime64(t, "s")))
         cbar = fig.colorbar(sc, ax=ax, fraction=0.025, pad=0.02, label="cluster")
         if ticks.size <= 20:
@@ -355,10 +412,175 @@ def plot_global_cluster_maps(dataset, labels, *, patch_size=8,
         plt.show()
 
 
-def _field_label(name):
-    """Physical label from the llc4320 registry, falling back to the raw name."""
-    spec = _FIELD_CMAPS.get(name)
-    return spec[1] if spec else name
+def plot_cluster_size_distribution(labels, *, top_n=None, drop_noise=False, log=False,
+                                   cumulative=True, cmap=None, max_tick_labels=40,
+                                   figsize=(14, 5)):
+    """Share of the data held by each cluster, largest first.
+
+    labels     : flat per-patch cluster labels; -1 (and NaN) noise is a cluster of
+                 its own unless drop_noise.
+    top_n      : draw only the largest n bars.
+    cumulative : overlay the running coverage of the ordered clusters, which is
+                 what tells you the top_n worth passing to the other cluster plots.
+    log        : log the percentage axis, for long tails of tiny clusters.
+
+    Bars carry the cluster's own color, so they match the map and patch views.
+    Returns (cluster_ids, percent) for the bars drawn.
+    """
+    ids, counts, frac = _cluster_order(labels, drop_noise)
+    pct = 100 * frac
+    cmap_d, norm = _cluster_cmap_norm(ids, cmap)
+
+    show = ids.size if top_n is None else min(top_n, ids.size)
+    x = np.arange(show)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.bar(x, pct[:show], color=cmap_d(norm(ids[:show])), width=1.0)
+    ax.set_xlabel("cluster (descending size)")
+    ax.set_ylabel("% of patches")
+    if log:
+        ax.set_yscale("log")
+    if show <= max_tick_labels:
+        ax.set_xticks(x)
+        ax.set_xticklabels(ids[:show], rotation=90)
+    ax.set_title(f"{ids.size} clusters | largest {pct[0]:.1f}% "
+                 f"(cluster {ids[0]}) | shown {show} cover {pct[:show].sum():.1f}%")
+
+    if cumulative:
+        ax2 = ax.twinx()
+        ax2.plot(x, np.cumsum(pct[:show]), color="k", lw=1.5)
+        ax2.set_ylabel("cumulative % of patches")
+        ax2.set_ylim(0, 100)
+
+    fig.tight_layout()
+    plt.show()
+    return ids[:show], pct[:show]
+
+
+def plot_cluster_feature_spread(dataset, labels, features=None, *, patch_size=8,
+                                top_n=None, n_clusters=20, max_per_cluster=2000,
+                                kind="violin", preproc=False, drop_noise=False,
+                                seed=0, panel_size=3, cmap=None):
+    """Spread of one or more features within each cluster: one row per feature,
+    one violin (or box) per cluster.
+
+    Every patch contributes its per-channel mean, so a violin is the distribution
+    of that feature over the patches the cluster holds.
+
+    features        : channel names/indices (default: all feature channels).
+    top_n           : plot the largest n clusters, size-ordered.  When None,
+                      n_clusters are drawn at random from every cluster present,
+                      so the small ones are represented too.
+    max_per_cluster : patches sampled per cluster before plotting.
+    preproc         : plot the training transform instead of physical units.
+    """
+    if kind not in ("violin", "box"):
+        raise ValueError("kind must be 'violin' or 'box'")
+
+    labels = _as_int_labels(labels)
+    values = dataset.get_patch_features(patch_size, preproc=preproc)   # (N_patches, C)
+    assert labels.size == values.shape[0], \
+        f"{labels.size} labels vs {values.shape[0]} patches"
+
+    feats = _resolve_features(features, dataset.channel_names)
+    ids, counts, pct = _select_clusters(labels, top_n, n_clusters, drop_noise, seed)
+    rng = np.random.default_rng(seed)
+    members = []
+    for c in ids:
+        idx = np.flatnonzero(labels == c)
+        if idx.size > max_per_cluster:
+            idx = rng.choice(idx, size=max_per_cluster, replace=False)
+        members.append(idx)
+
+    tiny = [int(c) for c, idx in zip(ids, members) if idx.size < 2]
+    if kind == "violin" and tiny:
+        raise ValueError(f"clusters {tiny} have <2 patches, which has no KDE; "
+                         f"use kind='box'")
+
+    cmap_d, norm = _cluster_cmap_norm(ids, cmap)
+    colors = cmap_d(norm(ids))
+    x = np.arange(ids.size)
+
+    fig, axes = plt.subplots(len(feats), 1, sharex=True, squeeze=False,
+                             figsize=(max(0.5 * ids.size, 8), panel_size * len(feats)))
+    for ax, (ci, name) in zip(axes[:, 0], feats):
+        data = [values[idx, ci] for idx in members]
+        if kind == "violin":
+            parts = ax.violinplot(data, positions=x, widths=0.9,
+                                  showextrema=False, showmedians=True)
+            for body, col in zip(parts["bodies"], colors):
+                body.set_facecolor(col)
+                body.set_alpha(0.85)
+        else:
+            bp = ax.boxplot(data, positions=x, widths=0.7, showfliers=False,
+                            patch_artist=True)
+            for box, col in zip(bp["boxes"], colors):
+                box.set_facecolor(col)
+        ax.set_ylabel(_field_label(name))
+        ax.grid(axis="y", lw=0.3, alpha=0.5)
+
+    axes[-1, 0].set_xticks(x)
+    axes[-1, 0].set_xticklabels([f"{c}\n{p:.2f}%" for c, p in zip(ids, pct)], fontsize=8)
+    axes[-1, 0].set_xlabel("cluster (label / % of patches)")
+    selection = "largest first" if top_n is not None else "random sample"
+    fig.suptitle(f"per-patch feature spread by cluster "
+                 f"({ids.size} clusters, {selection}, <={max_per_cluster} patches each)")
+    fig.tight_layout()
+    plt.show()
+
+
+def _cell_fraction(v):
+    """Share of a hexbin cell's patches belonging to the cluster.  Cells holding
+    none of it return NaN so they drop out of the map instead of tiling it with
+    zeros."""
+    f = np.mean(v)
+    return f if f > 0 else np.nan
+
+
+def plot_top_cluster_maps(dataset, labels, *, patch_size=8, top_n=12, n_cols=4,
+                          gridsize=60, normalize="count", extent=None, coastlines=True,
+                          panel_size=4, drop_noise=False, save_path=None):
+    """Where the largest clusters are found: one lon/lat hexbin heat map per
+    cluster, pooled over every timestamp (plot_global_cluster_maps instead splits
+    by timestamp and shows all clusters at once).
+
+    normalize : 'count'    -> patches of that cluster per cell.
+                'fraction' -> that count over all patches in the cell, i.e. the
+                              cluster's local prevalence, which divides out the
+                              uneven sampling density (see plot_sample_map).
+    extent    : (lon_min, lon_max, lat_min, lat_max); default is the whole globe.
+    save_path : if given, save the figure there before showing.
+    """
+    if normalize not in ("count", "fraction"):
+        raise ValueError("normalize must be 'count' or 'fraction'")
+
+    labels = _as_int_labels(labels)
+    lon, lat = dataset.get_patch_coords(patch_size)
+    assert labels.size == lon.size, f"{labels.size} labels vs {lon.size} patches"
+
+    ids, counts, pct = _select_clusters(labels, top_n=top_n, drop_noise=drop_noise)
+    hex_kw = dict(gridsize=gridsize, mincnt=1, cmap="magma", transform=_PROJ,
+                  extent=extent or (-180, 180, -90, 90), zorder=2)
+    bar_label = "patches / cell" if normalize == "count" else "fraction of cell"
+
+    n_rows = -(-ids.size // n_cols)                   # ceil
+    fig = plt.figure(figsize=(panel_size * n_cols, panel_size * 0.65 * n_rows))
+    for i, (c, n, p) in enumerate(zip(ids, counts, pct)):
+        ax = _global_ax(fig, (n_rows, n_cols, i + 1), extent, coastlines)
+        msk = labels == c
+        if normalize == "count":
+            hb = ax.hexbin(lon[msk], lat[msk], **hex_kw)
+        else:
+            hb = ax.hexbin(lon, lat, C=msk.astype(float),
+                           reduce_C_function=_cell_fraction, **hex_kw)
+        fig.colorbar(hb, ax=ax, fraction=0.03, pad=0.02, label=bar_label)
+        ax.set_title(f"cluster {c} | {n:,} patches | {p:.2f}%", fontsize=panel_size * 3)
+
+    fig.suptitle(f"top {ids.size} clusters by size ({normalize})")
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
 
 
 def _binned_trend(x, y, nbins):
@@ -467,22 +689,17 @@ def plot_sample_map(dataset, *, density=True, point_size=4, alpha=0.05,
     ok = np.isfinite(lat) & np.isfinite(lon)
     lat, lon = lat[ok], lon[ok]
 
-    proj = ccrs.PlateCarree()
     ncol = 2 if density else 1
-    fig, axes = plt.subplots(1, ncol, figsize=figsize, squeeze=False,
-                             subplot_kw={"projection": proj})
+    fig = plt.figure(figsize=figsize)
 
-    ax = axes[0][0]
-    ax.set_global(); ax.add_feature(cfeature.LAND, facecolor="0.92", zorder=0)
-    ax.coastlines(linewidth=0.5, zorder=1)
-    ax.scatter(lon, lat, s=point_size, alpha=alpha, transform=proj, zorder=2)
+    ax = _global_ax(fig, (1, ncol, 1))
+    ax.scatter(lon, lat, s=point_size, alpha=alpha, transform=_PROJ, zorder=2)
     ax.set_title(f"cutout centres (n={lat.size:,})")
 
     if density:
-        ax2 = axes[0][1]
-        ax2.set_global(); ax2.coastlines(linewidth=0.5)
+        ax2 = _global_ax(fig, (1, 2, 2))
         hb = ax2.hexbin(lon, lat, gridsize=gridsize, mincnt=1, cmap="magma",
-                        transform=proj, extent=(-180, 180, -90, 90))
+                        transform=_PROJ, extent=(-180, 180, -90, 90))
         fig.colorbar(hb, ax=ax2, fraction=0.025, pad=0.02, label="cutouts / cell")
         ax2.set_title("sampling density")
 
