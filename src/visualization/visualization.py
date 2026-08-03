@@ -210,6 +210,22 @@ def _field_label(name):
     return spec[1] if spec else name
 
 
+def _log_field(data):
+    """log10 with a positive floor, so exact zeros don't give -inf.  Mirrors the
+    dataset's log-gradient transform, applied here for display only."""
+    pos = data[data > 0]
+    return np.log10(np.maximum(data, pos.min() if pos.size else 1.0))
+
+
+def _display_field(name, data, logged):
+    """(values, panel title) for a displayed field.  Grad-magnitude channels are
+    log10'd because raw gradient magnitudes span orders of magnitude and wash out
+    to a flat wash on a linear scale."""
+    if name in logged:
+        return _log_field(data), f"log10 {name}"
+    return data, name
+
+
 def _axis_label(name, logged=False, standardized=False):
     """Axis label for a feature channel, marked with the transforms applied."""
     label = _field_label(name)
@@ -248,7 +264,7 @@ def _patch_grid(ax, H, W, patch_size):
 
 
 def _patch_overlay(ax, bg, bg_style, values, patch_size, *,
-                   cmap, norm=None, vmin=None, vmax=None):
+                   cmap, norm=None, vmin=None, vmax=None, alpha=0.9):
     """Field background with one value per patch drawn over the patch grid.
 
     bg_style : (cmap, vmin, vmax) for the background, from _field_style.
@@ -258,7 +274,7 @@ def _patch_overlay(ax, bg, bg_style, values, patch_size, *,
     bg_cmap, bg_vmin, bg_vmax = bg_style
     ax.imshow(bg, extent=[0, W, H, 0], cmap=bg_cmap, vmin=bg_vmin, vmax=bg_vmax)
     im = ax.imshow(values.reshape(H // patch_size, W // patch_size),
-                   cmap=cmap, norm=norm, vmin=vmin, vmax=vmax, alpha=0.9,
+                   cmap=cmap, norm=norm, vmin=vmin, vmax=vmax, alpha=alpha,
                    extent=[0, W, H, 0], interpolation="nearest")
     _patch_grid(ax, H, W, patch_size)
     return im
@@ -277,9 +293,10 @@ def _highlight_overlay(ax, bg, bg_style, mask, patch_size, color, alpha=0.55):
 
 
 def make_image_from_patches(dataset, labels, *, entropy=None,
-                            features=None, label_overlay_on=0,
+                            features=None, label_overlay_on=None,
                             patch_size=8, start=0, number_rows=6,
                             cutouts=None, highlight=None, show_map=False,
+                            log_grads=True, overlay_alpha=0.65,
                             metadata_fields=_DEFAULT_META_FIELDS,
                             panel_size=3, cmap=None,
                             meta_fontsize=None, title_fontsize=None, save_path=None):
@@ -292,7 +309,12 @@ def make_image_from_patches(dataset, labels, *, entropy=None,
                        to [0, 1]); adds a panel beside the cluster labels, on a
                        fixed [0, 1] scale so rows and figures are comparable.
     features         : channel names/indices to show (default: all features).
-    label_overlay_on : channel name/index used as the overlay background.
+    label_overlay_on : channel name/index used as the overlay background; defaults
+                       to the first grad-magnitude channel (the clearest backdrop
+                       for fronts and eddies), else the first channel.
+    log_grads        : display grad-magnitude channels on a log10 scale.
+    overlay_alpha    : opacity of the cluster overlay; lower it to read more of
+                       the field underneath.
     cutouts          : cutout indices to show, in order (default: every cutout).
     start            : offset into that order for the first row shown.
     highlight        : cluster label; the overlay then tints only that cluster's
@@ -305,6 +327,9 @@ def make_image_from_patches(dataset, labels, *, entropy=None,
     """
     channel_names = dataset.channel_names
     imgs, metadata, ids = dataset.X, dataset.metadata, dataset.ids
+    logged = dataset.log_scaled_channels if log_grads else []
+    if label_overlay_on is None:
+        label_overlay_on = logged[0] if logged else 0
     feats = _resolve_features(features, channel_names)
     bg_idx = _resolve_features([label_overlay_on], channel_names)[0][0]
 
@@ -339,22 +364,24 @@ def make_image_from_patches(dataset, labels, *, entropy=None,
 
         for col, (idx, name) in enumerate(feats):
             ax = fig.add_subplot(gs[2 * r, col])
-            f_cmap, vmin, vmax = _field_style(name, img[idx])
-            ax.imshow(img[idx], cmap=f_cmap, vmin=vmin, vmax=vmax)
+            vals, title = _display_field(name, img[idx], logged)
+            f_cmap, vmin, vmax = _field_style(name, vals)
+            ax.imshow(vals, cmap=f_cmap, vmin=vmin, vmax=vmax)
             ax.set_xticks([]); ax.set_yticks([])
             if r == 0:
-                ax.set_title(name, fontsize=title_fontsize)
+                ax.set_title(title, fontsize=title_fontsize)
 
-        bg_style = _field_style(channel_names[bg_idx], img[bg_idx])
+        bg, _ = _display_field(channel_names[bg_idx], img[bg_idx], logged)
+        bg_style = _field_style(channel_names[bg_idx], bg)
 
         ax = fig.add_subplot(gs[2 * r, len(feats)])
         patch_labels = labels[sl]
         assert patch_labels.size == ppi, f"expected {ppi} labels, got {patch_labels.size}"
         if highlight is None:
-            _patch_overlay(ax, img[bg_idx], bg_style, patch_labels, patch_size,
-                           cmap=cmap, norm=norm)
+            _patch_overlay(ax, bg, bg_style, patch_labels, patch_size,
+                           cmap=cmap, norm=norm, alpha=overlay_alpha)
         else:
-            _highlight_overlay(ax, img[bg_idx], bg_style, patch_labels == highlight,
+            _highlight_overlay(ax, bg, bg_style, patch_labels == highlight,
                                patch_size, cmap(norm(highlight)))
         if r == 0:
             ax.set_title("clusters" if highlight is None else f"cluster {highlight}",
@@ -362,7 +389,7 @@ def make_image_from_patches(dataset, labels, *, entropy=None,
 
         if entropy is not None:
             ax = fig.add_subplot(gs[2 * r, len(feats) + 1])
-            ent_im = _patch_overlay(ax, img[bg_idx], bg_style, entropy[sl], patch_size,
+            ent_im = _patch_overlay(ax, bg, bg_style, entropy[sl], patch_size,
                                     cmap=_ENTROPY_CMAP, vmin=0.0, vmax=1.0)
             entropy_axes.append(ax)
             if r == 0:
@@ -484,61 +511,6 @@ def plot_global_cluster_maps(dataset, labels, *, patch_size=8,
         _cluster_colorbar(fig, sc, ax, labels)
         if save_dir:
             fig.savefig(os.path.join(save_dir, f"clusters_{np.datetime64(t, 's')}.png"),
-                        dpi=150, bbox_inches="tight")
-        plt.show()
-
-
-def plot_global_field_cluster_maps(dataset, labels, field="gradb2", *, patch_size=8,
-                                   log_grads=True, clusters=None, point_size=14,
-                                   cluster_size=None, cluster_alpha=0.9,
-                                   extent=None, coastlines=True, panel_size=10,
-                                   drop_noise=False, cmap=None, save_dir=None):
-    """One global map per timestamp: the sampled field where cutouts were taken,
-    with cluster squares drawn over it.
-
-    The field only exists at sampled patch locations, so each patch is a square
-    colored by its mean value, with a smaller square in the cluster's own color on
-    top -- the field stays visible as a border around each cluster square.  The
-    field's color scale is shared across timestamps so the panels are comparable.
-
-    field      : channel drawn underneath (default the buoyancy gradient).
-    log_grads  : log10 the gradient-magnitude channels before averaging.
-    clusters   : labels to overlay (default all); pass e.g. the ids returned by
-                 plot_cluster_size_distribution to overlay only the largest.
-    save_dir   : if given, save each figure as <field>_clusters_<timestamp>.png.
-    """
-    ci, name = _resolve_features([field], dataset.channel_names)[0]
-    lon, lat, labels, ts, keep = _patch_map_data(dataset, labels, patch_size, drop_noise)
-    values = dataset.get_patch_features(patch_size, log_grads=log_grads)[keep, ci]
-
-    shown = (np.ones(labels.size, bool) if clusters is None
-             else np.isin(labels, np.asarray(clusters, dtype=int)))
-    if not shown.any():
-        raise ValueError(f"none of clusters={clusters} are present")
-
-    f_cmap, vmin, vmax = _field_style(name, values)
-    f_label = _axis_label(name, log_grads and name in dataset.log_scaled_channels)
-    cmap_d, norm = _cluster_cmap_norm(labels[shown], cmap)
-    cluster_size = cluster_size or point_size * 0.35
-    if extent is None:
-        extent = _fit_extent(lon, lat)
-
-    for t in np.unique(ts):
-        msk = ts == t
-        sel = msk & shown
-        fig = plt.figure(figsize=(panel_size, panel_size * 0.55))
-        ax = _global_ax(fig, (1, 1, 1), extent, coastlines, draw_labels=True)
-        _reserve_side_colorbars(fig, 2)
-        fm = ax.scatter(lon[msk], lat[msk], c=values[msk], cmap=f_cmap, vmin=vmin, vmax=vmax,
-                        s=point_size, marker="s", linewidths=0, transform=_PROJ, zorder=2)
-        cl = ax.scatter(lon[sel], lat[sel], c=labels[sel], cmap=cmap_d, norm=norm,
-                        s=cluster_size, marker="s", alpha=cluster_alpha, linewidths=0,
-                        transform=_PROJ, zorder=3)
-        ax.set_title(f"{np.datetime64(t, 's')}  |  {int(msk.sum()):,} patches")
-        _side_colorbar(fig, ax, fm, f_label, slot=0)
-        _cluster_colorbar(fig, cl, ax, labels[shown], slot=1)
-        if save_dir:
-            fig.savefig(os.path.join(save_dir, f"{name}_clusters_{np.datetime64(t, 's')}.png"),
                         dpi=150, bbox_inches="tight")
         plt.show()
 
