@@ -220,14 +220,28 @@ class CutoutDataset:
         p = _to_patches(X, patch_size)
         return p.reshape(p.shape[0], -1) if flatten else p
 
-    def get_patch_features(self, patch_size, preproc=False):
+    def get_patch_features(self, patch_size, preproc=False, log_grads=False):
         """Per-patch mean of each feature channel, (N_patches, C_feat), aligned
         with get_patches order.  preproc=False keeps physical units; preproc=True
         applies the training transform.  Reduces straight from X, so the full
-        patch stack is never materialized."""
-        X = self.preprocess_for_training() if preproc else self.X
+        patch stack is never materialized.
+
+        log_grads log10s the gradient-magnitude channels first, so those come back
+        as a mean of logs, matching the training transform; it is redundant under
+        preproc, which already logs them."""
+        if preproc:
+            X = self.preprocess_for_training()
+        elif log_grads:
+            X = self._log_gradients()
+        else:
+            X = self.X
         return reduce(X, 'n c (h p1) (w p2) -> (n h w) c', 'mean',
                       p1=patch_size, p2=patch_size)
+
+    @property
+    def log_scaled_channels(self):
+        """Feature channels that the log-gradient transform log10s."""
+        return [c for c in self.channel_names if c.startswith(_GRAD_PREFIX)]
 
     def get_patch_coords(self, patch_size):
         """Per-patch center (lon, lat), aligned with get_patches order."""

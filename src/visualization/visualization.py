@@ -4,6 +4,7 @@ import os
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import cmocean
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -209,6 +210,14 @@ def _field_label(name):
     return spec[1] if spec else name
 
 
+def _axis_label(name, logged=False, standardized=False):
+    """Axis label for a feature channel, marked with the transforms applied."""
+    label = _field_label(name)
+    if logged:
+        label = f"log10 {label}"
+    return f"{label} (z-scored)" if standardized else label
+
+
 def _format_meta(row, fields):
     if row is None:
         return ""
@@ -229,6 +238,15 @@ def _format_meta(row, fields):
 _ENTROPY_CMAP = "viridis"
 
 
+def _patch_grid(ax, H, W, patch_size):
+    """Patch boundaries over the current image."""
+    for g in range(0, H + 1, patch_size):
+        ax.axhline(g, color="k", lw=0.8, alpha=0.6)
+    for g in range(0, W + 1, patch_size):
+        ax.axvline(g, color="k", lw=0.8, alpha=0.6)
+    ax.set_xticks([]); ax.set_yticks([])
+
+
 def _patch_overlay(ax, bg, bg_style, values, patch_size, *,
                    cmap, norm=None, vmin=None, vmax=None):
     """Field background with one value per patch drawn over the patch grid.
@@ -242,17 +260,26 @@ def _patch_overlay(ax, bg, bg_style, values, patch_size, *,
     im = ax.imshow(values.reshape(H // patch_size, W // patch_size),
                    cmap=cmap, norm=norm, vmin=vmin, vmax=vmax, alpha=0.9,
                    extent=[0, W, H, 0], interpolation="nearest")
-    for g in range(0, H + 1, patch_size):
-        ax.axhline(g, color="k", lw=0.8, alpha=0.6)
-    for g in range(0, W + 1, patch_size):
-        ax.axvline(g, color="k", lw=0.8, alpha=0.6)
-    ax.set_xticks([]); ax.set_yticks([])
+    _patch_grid(ax, H, W, patch_size)
     return im
+
+
+def _highlight_overlay(ax, bg, bg_style, mask, patch_size, color, alpha=0.55):
+    """Field background with only the patches in ``mask`` tinted, for inspecting
+    one cluster.  Everything else is left as the bare field."""
+    H, W = bg.shape
+    bg_cmap, bg_vmin, bg_vmax = bg_style
+    ax.imshow(bg, extent=[0, W, H, 0], cmap=bg_cmap, vmin=bg_vmin, vmax=bg_vmax)
+    rgba = np.zeros((H // patch_size, W // patch_size, 4))
+    rgba[mask.reshape(H // patch_size, W // patch_size)] = (*color[:3], alpha)
+    ax.imshow(rgba, extent=[0, W, H, 0], interpolation="nearest")
+    _patch_grid(ax, H, W, patch_size)
 
 
 def make_image_from_patches(dataset, labels, *, entropy=None,
                             features=None, label_overlay_on=0,
                             patch_size=8, start=0, number_rows=6,
+                            cutouts=None, highlight=None, show_map=False,
                             metadata_fields=_DEFAULT_META_FIELDS,
                             panel_size=3, cmap=None,
                             meta_fontsize=None, title_fontsize=None, save_path=None):
@@ -266,7 +293,11 @@ def make_image_from_patches(dataset, labels, *, entropy=None,
                        fixed [0, 1] scale so rows and figures are comparable.
     features         : channel names/indices to show (default: all features).
     label_overlay_on : channel name/index used as the overlay background.
-    start            : index of the first cutout to show.
+    cutouts          : cutout indices to show, in order (default: every cutout).
+    start            : offset into that order for the first row shown.
+    highlight        : cluster label; the overlay then tints only that cluster's
+                       patches and leaves the rest of the field bare.
+    show_map         : add a column locating each cutout on a global map.
     save_path        : if given, save the figure there before showing.
 
     ``labels`` (and ``entropy``) are flat per-patch in dataset order
@@ -280,12 +311,14 @@ def make_image_from_patches(dataset, labels, *, entropy=None,
     meta_fontsize = meta_fontsize or int(panel_size * 6)
     title_fontsize = title_fontsize or int(panel_size * 4)
 
-    number_rows = min(number_rows, len(imgs) - start)
+    rows = np.arange(len(imgs)) if cutouts is None else np.asarray(cutouts, dtype=int)
+    rows = rows[start:start + number_rows]
+    number_rows = len(rows)
     H, W = imgs.shape[2], imgs.shape[3]
     n_h, n_w = H // patch_size, W // patch_size
     ppi = n_h * n_w
 
-    labels = np.asarray(labels)
+    labels = _as_int_labels(labels)
     cmap, norm = _cluster_cmap_norm(labels, cmap)   # grey slot for -1 noise
 
     if entropy is not None:
@@ -293,16 +326,16 @@ def make_image_from_patches(dataset, labels, *, entropy=None,
         assert entropy.size == labels.size, \
             f"{entropy.size} entropy values vs {labels.size} labels"
 
-    n_col = len(feats) + 1 + (1 if entropy is not None else 0)
+    n_col = len(feats) + 1 + (1 if entropy is not None else 0) + (1 if show_map else 0)
     fig = plt.figure(figsize=(panel_size * n_col, panel_size * 1.4 * number_rows))
     gs = fig.add_gridspec(number_rows * 2, n_col,
                           height_ratios=[6, 2] * number_rows, hspace=0.06, wspace=0.05)
     entropy_axes = []
 
-    for r in range(number_rows):
-        c = start + r
+    for r, c in enumerate(rows):
         img = np.asarray(imgs[c])
         sl = slice(c * ppi, (c + 1) * ppi)
+        row = metadata.loc[ids[c]] if ids[c] in metadata.index else None
 
         for col, (idx, name) in enumerate(feats):
             ax = fig.add_subplot(gs[2 * r, col])
@@ -317,10 +350,15 @@ def make_image_from_patches(dataset, labels, *, entropy=None,
         ax = fig.add_subplot(gs[2 * r, len(feats)])
         patch_labels = labels[sl]
         assert patch_labels.size == ppi, f"expected {ppi} labels, got {patch_labels.size}"
-        _patch_overlay(ax, img[bg_idx], bg_style, patch_labels, patch_size,
-                       cmap=cmap, norm=norm)
+        if highlight is None:
+            _patch_overlay(ax, img[bg_idx], bg_style, patch_labels, patch_size,
+                           cmap=cmap, norm=norm)
+        else:
+            _highlight_overlay(ax, img[bg_idx], bg_style, patch_labels == highlight,
+                               patch_size, cmap(norm(highlight)))
         if r == 0:
-            ax.set_title("clusters", fontsize=title_fontsize)
+            ax.set_title("clusters" if highlight is None else f"cluster {highlight}",
+                         fontsize=title_fontsize)
 
         if entropy is not None:
             ax = fig.add_subplot(gs[2 * r, len(feats) + 1])
@@ -330,9 +368,18 @@ def make_image_from_patches(dataset, labels, *, entropy=None,
             if r == 0:
                 ax.set_title("entropy", fontsize=title_fontsize)
 
+        if show_map:
+            ax = _global_ax(fig, (gs[2 * r, n_col - 1],))
+            if row is not None:
+                ax.scatter([row["center_lon"]], [row["center_lat"]], s=80, color="red",
+                           marker="*", transform=_PROJ, zorder=3)
+            if r == 0:
+                ax.set_title("location", fontsize=title_fontsize)
+
         cap = fig.add_subplot(gs[2 * r + 1, :]); cap.axis("off")
-        row = metadata.loc[ids[c]] if ids[c] in metadata.index else None
-        cap.text(0.01, 0.5, _format_meta(row, metadata_fields),
+        prefix = ("" if highlight is None else
+                  f"cluster {highlight}: {int((patch_labels == highlight).sum())} patches     ")
+        cap.text(0.01, 0.5, prefix + _format_meta(row, metadata_fields),
                  va="center", ha="left", fontsize=meta_fontsize, family="monospace")
 
     if entropy_axes:
@@ -458,6 +505,7 @@ def plot_cluster_size_distribution(labels, *, top_n=None, drop_noise=False, log=
 
 
 def plot_cluster_feature_spread(dataset, labels, features=None, *, patch_size=8,
+                                entropy=None, show_time=False, log_grads=True,
                                 top_n=None, n_clusters=20, max_per_cluster=2000,
                                 kind="violin", preproc=False, drop_noise=False,
                                 seed=0, panel_size=3, cmap=None):
@@ -468,6 +516,11 @@ def plot_cluster_feature_spread(dataset, labels, features=None, *, patch_size=8,
     of that feature over the patches the cluster holds.
 
     features        : channel names/indices (default: all feature channels).
+    entropy         : optional per-patch ensemble entropy (NEMI.entropy), added as
+                      its own row.
+    show_time       : add a row for the distribution of patch timestamps.
+    log_grads       : log10 the gradient-magnitude channels (gradb2, gradrho2)
+                      before averaging, since they span orders of magnitude.
     top_n           : plot the largest n clusters, size-ordered.  When None,
                       n_clusters are drawn at random from every cluster present,
                       so the small ones are represented too.
@@ -478,11 +531,23 @@ def plot_cluster_feature_spread(dataset, labels, features=None, *, patch_size=8,
         raise ValueError("kind must be 'violin' or 'box'")
 
     labels = _as_int_labels(labels)
-    values = dataset.get_patch_features(patch_size, preproc=preproc)   # (N_patches, C)
+    values = dataset.get_patch_features(patch_size, preproc=preproc,
+                                        log_grads=log_grads)           # (N_patches, C)
     assert labels.size == values.shape[0], \
         f"{labels.size} labels vs {values.shape[0]} patches"
 
     feats = _resolve_features(features, dataset.channel_names)
+    logged = dataset.log_scaled_channels if (log_grads or preproc) else []
+    panels = [(values[:, ci], _axis_label(name, name in logged, preproc), False)
+              for ci, name in feats]
+    if show_time:
+        panels.append((mdates.date2num(dataset.get_patch_times(patch_size)), "time", True))
+    if entropy is not None:
+        entropy = np.asarray(entropy)
+        assert entropy.size == labels.size, \
+            f"{entropy.size} entropy values vs {labels.size} labels"
+        panels.append((entropy, "entropy", False))
+
     ids, counts, pct = _select_clusters(labels, top_n, n_clusters, drop_noise, seed)
     rng = np.random.default_rng(seed)
     members = []
@@ -492,19 +557,23 @@ def plot_cluster_feature_spread(dataset, labels, features=None, *, patch_size=8,
             idx = rng.choice(idx, size=max_per_cluster, replace=False)
         members.append(idx)
 
-    tiny = [int(c) for c, idx in zip(ids, members) if idx.size < 2]
-    if kind == "violin" and tiny:
-        raise ValueError(f"clusters {tiny} have <2 patches, which has no KDE; "
-                         f"use kind='box'")
+    # non-finite values (NaT timestamps, missing metadata) drop out per panel
+    panel_data = []
+    for vals, label, is_time in panels:
+        data = [vals[idx][np.isfinite(vals[idx])] for idx in members]
+        short = [int(c) for c, d in zip(ids, data) if d.size < 2]
+        if kind == "violin" and short:
+            raise ValueError(f"clusters {short} have <2 finite '{label}' values, which "
+                             f"has no KDE; use kind='box'")
+        panel_data.append((label, is_time, data))
 
     cmap_d, norm = _cluster_cmap_norm(ids, cmap)
     colors = cmap_d(norm(ids))
     x = np.arange(ids.size)
 
-    fig, axes = plt.subplots(len(feats), 1, sharex=True, squeeze=False,
-                             figsize=(max(0.5 * ids.size, 8), panel_size * len(feats)))
-    for ax, (ci, name) in zip(axes[:, 0], feats):
-        data = [values[idx, ci] for idx in members]
+    fig, axes = plt.subplots(len(panel_data), 1, sharex=True, squeeze=False,
+                             figsize=(max(0.5 * ids.size, 8), panel_size * len(panel_data)))
+    for ax, (label, is_time, data) in zip(axes[:, 0], panel_data):
         if kind == "violin":
             parts = ax.violinplot(data, positions=x, widths=0.9,
                                   showextrema=False, showmedians=True)
@@ -516,7 +585,9 @@ def plot_cluster_feature_spread(dataset, labels, features=None, *, patch_size=8,
                             patch_artist=True)
             for box, col in zip(bp["boxes"], colors):
                 box.set_facecolor(col)
-        ax.set_ylabel(_field_label(name))
+        ax.set_ylabel(label)
+        if is_time:
+            ax.yaxis_date()
         ax.grid(axis="y", lw=0.3, alpha=0.5)
 
     axes[-1, 0].set_xticks(x)
@@ -581,6 +652,39 @@ def plot_top_cluster_maps(dataset, labels, *, patch_size=8, top_n=12, n_cols=4,
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
+
+
+def _cutouts_with_cluster(labels, cluster, ppi):
+    """(cutout indices, per-cutout patch counts) for the cutouts holding a cluster,
+    the cutouts richest in it first."""
+    per_cutout = (_as_int_labels(labels) == cluster).reshape(-1, ppi).sum(axis=1)
+    idx = np.flatnonzero(per_cutout)
+    order = np.argsort(-per_cutout[idx], kind="stable")
+    return idx[order], per_cutout[idx][order]
+
+
+def plot_cluster_cutouts(dataset, labels, cluster, *, features=None, patch_size=8,
+                         number_rows=6, start=0, **kwargs):
+    """Cutouts where a given cluster appears: the requested fields, an overlay
+    tinting just that cluster's patches, a global map locating each cutout, and
+    the timestamp in the row caption.
+
+    cluster : the cluster's actual label, as titled by plot_top_cluster_maps and
+              returned by plot_cluster_size_distribution -- not a size rank.
+    Cutouts are ordered by how many patches of the cluster they hold, so start
+    pages down from the richest examples.  Extra keyword arguments go to
+    make_image_from_patches (entropy, panel_size, save_path, ...).
+    """
+    H, W = dataset.X.shape[2], dataset.X.shape[3]
+    ppi = (H // patch_size) * (W // patch_size)
+    idx, counts = _cutouts_with_cluster(labels, cluster, ppi)
+    if idx.size == 0:
+        raise ValueError(f"cluster {cluster} is not present in any cutout")
+    print(f"cluster {cluster}: {counts.sum():,} patches across {idx.size:,} cutouts "
+          f"| richest holds {counts[0]} of {ppi}")
+    make_image_from_patches(dataset, labels, features=features, patch_size=patch_size,
+                            cutouts=idx, highlight=cluster, show_map=True,
+                            number_rows=number_rows, start=start, **kwargs)
 
 
 def _binned_trend(x, y, nbins):
