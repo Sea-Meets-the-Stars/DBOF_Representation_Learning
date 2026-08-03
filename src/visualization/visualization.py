@@ -411,6 +411,47 @@ def _global_ax(fig, subplot, extent=None, coastlines=True, draw_labels=False):
     return ax
 
 
+def _patch_map_data(dataset, labels, patch_size, drop_noise=False):
+    """Per-patch (lon, lat, labels, times) for mapping, plus the keep mask.
+    Patches with no timestamp (and noise, when drop_noise) are dropped."""
+    lon, lat = dataset.get_patch_coords(patch_size)
+    ts = dataset.get_patch_times(patch_size)
+    labels = _as_int_labels(labels)
+    assert labels.size == lon.size, f"{labels.size} labels vs {lon.size} patches"
+    keep = ~np.isnat(ts)
+    if drop_noise:
+        keep &= labels >= 0
+    return lon[keep], lat[keep], labels[keep], ts[keep], keep
+
+
+def _fit_extent(lon, lat, margin=2.0):
+    """Extent framing every point, with a margin."""
+    return (lon.min() - margin, lon.max() + margin, lat.min() - margin, lat.max() + margin)
+
+
+def _side_colorbar(fig, ax, mappable, label, slot=0, width=0.018, gap=0.12):
+    """Colorbar in its own axis to the right of a map axis.  Stealing space from a
+    fixed-aspect GeoAxes (fig.colorbar(ax=...)) shrinks the map and lets the
+    colorbar clip its lon/lat labels, so the axis is placed explicitly instead.
+    slot counts outward from the map, so several stack without colliding."""
+    cax = ax.inset_axes([1.0 + gap * (slot + 1), 0.0, width, 1.0], transform=ax.transAxes)
+    return fig.colorbar(mappable, cax=cax, label=label)
+
+
+def _reserve_side_colorbars(fig, n):
+    """Shrink the plotting area so n side colorbars fit inside the figure."""
+    fig.subplots_adjust(right=0.92 - 0.10 * n)
+
+
+def _cluster_colorbar(fig, mappable, ax, labels, slot=0, max_ticks=20):
+    """Colorbar for discrete cluster labels, ticked only when few enough to read."""
+    cbar = _side_colorbar(fig, ax, mappable, "cluster", slot=slot)
+    ticks = np.arange(int(labels.min()), int(labels.max()) + 1)
+    if ticks.size <= max_ticks:
+        cbar.set_ticks(ticks)
+    return cbar
+
+
 def plot_global_cluster_maps(dataset, labels, *, patch_size=8,
                              cmap=None, alpha=0.5, point_size=8, extent=None,
                              coastlines=True, panel_size=8, drop_noise=False,
@@ -426,35 +467,78 @@ def plot_global_cluster_maps(dataset, labels, *, patch_size=8,
                shared across timestamps.  Use (-180, 180, -90, 90) for the globe.
     save_dir : if given, save each figure as clusters_<timestamp>.png there.
     """
-    lon, lat = dataset.get_patch_coords(patch_size)
-    ts = dataset.get_patch_times(patch_size)
-
-    labels = _as_int_labels(labels)
-    assert labels.size == lon.size, f"{labels.size} labels vs {lon.size} patches"
-
-    keep = ~np.isnat(ts)
-    if drop_noise:
-        keep &= labels >= 0
-    lon, lat, labels, ts = lon[keep], lat[keep], labels[keep], ts[keep]
+    lon, lat, labels, ts, _ = _patch_map_data(dataset, labels, patch_size, drop_noise)
 
     cmap_d, norm = _cluster_cmap_norm(labels, cmap)
     if extent is None:
-        m = 2.0
-        extent = (lon.min() - m, lon.max() + m, lat.min() - m, lat.max() + m)
-    ticks = np.arange(int(labels.min()), int(labels.max()) + 1)
+        extent = _fit_extent(lon, lat)
 
     for t in np.unique(ts):
         msk = ts == t
         fig = plt.figure(figsize=(panel_size, panel_size * 0.55))
         ax = _global_ax(fig, (1, 1, 1), extent, coastlines, draw_labels=True)
+        _reserve_side_colorbars(fig, 1)
         sc = ax.scatter(lon[msk], lat[msk], c=labels[msk], cmap=cmap_d, norm=norm,
                         s=point_size, alpha=alpha, linewidths=0, transform=_PROJ, zorder=2)
         ax.set_title(str(np.datetime64(t, "s")))
-        cbar = fig.colorbar(sc, ax=ax, fraction=0.025, pad=0.02, label="cluster")
-        if ticks.size <= 20:
-            cbar.set_ticks(ticks)
+        _cluster_colorbar(fig, sc, ax, labels)
         if save_dir:
             fig.savefig(os.path.join(save_dir, f"clusters_{np.datetime64(t, 's')}.png"),
+                        dpi=150, bbox_inches="tight")
+        plt.show()
+
+
+def plot_global_field_cluster_maps(dataset, labels, field="gradb2", *, patch_size=8,
+                                   log_grads=True, clusters=None, point_size=14,
+                                   cluster_size=None, cluster_alpha=0.9,
+                                   extent=None, coastlines=True, panel_size=10,
+                                   drop_noise=False, cmap=None, save_dir=None):
+    """One global map per timestamp: the sampled field where cutouts were taken,
+    with cluster squares drawn over it.
+
+    The field only exists at sampled patch locations, so each patch is a square
+    colored by its mean value, with a smaller square in the cluster's own color on
+    top -- the field stays visible as a border around each cluster square.  The
+    field's color scale is shared across timestamps so the panels are comparable.
+
+    field      : channel drawn underneath (default the buoyancy gradient).
+    log_grads  : log10 the gradient-magnitude channels before averaging.
+    clusters   : labels to overlay (default all); pass e.g. the ids returned by
+                 plot_cluster_size_distribution to overlay only the largest.
+    save_dir   : if given, save each figure as <field>_clusters_<timestamp>.png.
+    """
+    ci, name = _resolve_features([field], dataset.channel_names)[0]
+    lon, lat, labels, ts, keep = _patch_map_data(dataset, labels, patch_size, drop_noise)
+    values = dataset.get_patch_features(patch_size, log_grads=log_grads)[keep, ci]
+
+    shown = (np.ones(labels.size, bool) if clusters is None
+             else np.isin(labels, np.asarray(clusters, dtype=int)))
+    if not shown.any():
+        raise ValueError(f"none of clusters={clusters} are present")
+
+    f_cmap, vmin, vmax = _field_style(name, values)
+    f_label = _axis_label(name, log_grads and name in dataset.log_scaled_channels)
+    cmap_d, norm = _cluster_cmap_norm(labels[shown], cmap)
+    cluster_size = cluster_size or point_size * 0.35
+    if extent is None:
+        extent = _fit_extent(lon, lat)
+
+    for t in np.unique(ts):
+        msk = ts == t
+        sel = msk & shown
+        fig = plt.figure(figsize=(panel_size, panel_size * 0.55))
+        ax = _global_ax(fig, (1, 1, 1), extent, coastlines, draw_labels=True)
+        _reserve_side_colorbars(fig, 2)
+        fm = ax.scatter(lon[msk], lat[msk], c=values[msk], cmap=f_cmap, vmin=vmin, vmax=vmax,
+                        s=point_size, marker="s", linewidths=0, transform=_PROJ, zorder=2)
+        cl = ax.scatter(lon[sel], lat[sel], c=labels[sel], cmap=cmap_d, norm=norm,
+                        s=cluster_size, marker="s", alpha=cluster_alpha, linewidths=0,
+                        transform=_PROJ, zorder=3)
+        ax.set_title(f"{np.datetime64(t, 's')}  |  {int(msk.sum()):,} patches")
+        _side_colorbar(fig, ax, fm, f_label, slot=0)
+        _cluster_colorbar(fig, cl, ax, labels[shown], slot=1)
+        if save_dir:
+            fig.savefig(os.path.join(save_dir, f"{name}_clusters_{np.datetime64(t, 's')}.png"),
                         dpi=150, bbox_inches="tight")
         plt.show()
 
