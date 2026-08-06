@@ -2,7 +2,10 @@ import dbof.cutout_dataset_creation.zarr_dataset as zarr_dataset
 import dbof.cutout_dataset_creation.metadata as metadata_mod
 import dbof.io.filesystems as filesystems
 from dask.distributed import Client
+import json
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset, DataLoader
 from einops import rearrange, reduce
@@ -47,12 +50,29 @@ class CutoutDataSource:
                  run_id=DEFAULT_RUN_ID, dataset_name=DEFAULT_DATASET_NAME,
                  s3_endpoint=DEFAULT_S3_ENDPOINT):
         self.bucket, self.folder, self.run_id = bucket, folder, run_id
+        self.dataset_name, self.s3_endpoint = dataset_name, s3_endpoint
         self.fs, self.fs_synch = filesystems.create_s3_filesystems(s3_endpoint)
         self.reader = zarr_dataset.ZarrDatasetReader(
             bucket=bucket, folder=folder, run_id=run_id,
             dataset_name=dataset_name, fs=self.fs,
         )
         self.channel_names = self.reader.channel_names
+
+    @property
+    def source_info(self):
+        """S3 coordinates plus store geometry, recorded with cluster labels so a
+        consumer can locate this dataset and rebuild cutout geometry without
+        opening the image store.  down_sample_res is not in the metadata parquet,
+        so it is only available here."""
+        return {
+            "s3_endpoint": self.s3_endpoint,
+            "bucket": self.bucket,
+            "folder": self.folder,
+            "run_id": self.run_id,
+            "dataset_name": self.dataset_name,
+            "down_sample_res": self.reader.down_sample_res,
+            "target_km_res": self.reader.target_km_res,
+        }
 
     def full_dataset_as_dask(self):
         return self.reader.full_dataset_as_dask()
@@ -158,7 +178,8 @@ class CutoutDataset:
     physical values.
     """
 
-    def __init__(self, X, coords, ids, metadata, channel_names, coord_names, mean, std):
+    def __init__(self, X, coords, ids, metadata, channel_names, coord_names, mean, std,
+                 source_info=None):
         self.X = X                        # (N, C_feat, H, W) raw features
         self.coords = coords              # (N, C_coord, H, W) raw XC/YC
         self.ids = ids                    # decoded image_id per row, parallel to X
@@ -166,6 +187,7 @@ class CutoutDataset:
         self.channel_names = channel_names   # feature names (no XC/YC)
         self.coord_names = coord_names       # e.g. ["XC", "YC"]
         self.mean, self.std = mean, std      # per-feature z-score stats (C_feat,)
+        self.source_info = source_info or {}  # see CutoutDataSource.source_info
 
     @classmethod
     def from_source(cls, source=None, data_channels=None, coord_channels=("XC", "YC"),
@@ -180,7 +202,8 @@ class CutoutDataset:
             images, source.channel_names, data_channels, coord_channels)
         print(f"features {list(data_channels)} | coords {list(coord_channels)}")
         return cls(X, coords, [_as_str(i) for i in ids], source.read_metadata(),
-                   list(data_channels), list(coord_channels), mean, std)
+                   list(data_channels), list(coord_channels), mean, std,
+                   source_info=source.source_info)
 
     def __len__(self):
         return len(self.X)
@@ -262,3 +285,46 @@ class CutoutDataset:
         X = self.preprocess_for_training() if preproc else self.X
         return DataLoader(_CutoutTorch(X, self.ids), batch_size=batch_size,
                           shuffle=shuffle, num_workers=num_workers, pin_memory=True)
+
+    def save_cluster_labels(self, path, labels, patch_size):
+        """Write per-cutout cluster labels to parquet, keyed by image_id.
+
+        Clustering output is a flat per-patch array whose only link to the data is
+        position, and that row order -- store append order, minus the ice/NaN
+        filter -- cannot be recovered afterwards.  Resolving it here means nothing
+        downstream depends on array alignment: one row per cutout, holding that
+        cutout's labels in row-major patch order.
+
+        labels : flat per-patch cluster labels in dataset order (e.g. NEMI's
+                 ``clusters``).  NaN is stored as -1, matching the noise label.
+        """
+        if not self.source_info:
+            raise ValueError("source_info missing; build with CutoutDataset.from_source")
+
+        H, W = self.X.shape[2], self.X.shape[3]
+        if H % patch_size or W % patch_size:
+            raise ValueError(f"patch_size {patch_size} does not divide cutout {H}x{W}")
+        ppi = (H // patch_size) * (W // patch_size)
+
+        labels = np.nan_to_num(np.asarray(labels, dtype="float64"), nan=-1.0).astype("int32")
+        if labels.size != len(self.ids) * ppi:
+            raise ValueError(
+                f"{labels.size} labels but {len(self.ids)} cutouts x {ppi} patches "
+                f"= {len(self.ids) * ppi}; labels and dataset are from different runs")
+        lo, hi = np.iinfo("int16").min, np.iinfo("int16").max
+        if labels.min() < lo or labels.max() > hi:
+            raise ValueError(f"labels outside int16: [{labels.min()}, {labels.max()}]")
+
+        table = pa.table({
+            "image_id": pa.array(self.ids, type=pa.string()),
+            "labels": pa.FixedSizeListArray.from_arrays(
+                pa.array(labels.astype("int16")), ppi),
+        })
+        table = table.replace_schema_metadata({b"dbof": json.dumps({
+            "patch_size": patch_size,
+            "patches_per_cutout": ppi,
+            "cutout_shape": [H, W],
+            "channel_names": self.channel_names,
+            **self.source_info,
+        }).encode()})
+        pq.write_table(table, path)
