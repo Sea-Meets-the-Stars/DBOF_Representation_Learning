@@ -286,7 +286,24 @@ class CutoutDataset:
         return DataLoader(_CutoutTorch(X, self.ids), batch_size=batch_size,
                           shuffle=shuffle, num_workers=num_workers, pin_memory=True)
 
-    def save_cluster_labels(self, path, labels, patch_size):
+    def _per_patch(self, values, ppi, dtype, what):
+        """One parquet row per cutout, holding that cutout's `ppi` values in
+        row-major patch order.  Guards the cast as well as the length -- numpy
+        narrows silently, so an out-of-range label would wrap rather than raise.
+        """
+        values = np.asarray(values)
+        if values.size != len(self.ids) * ppi:
+            raise ValueError(
+                f"{values.size} {what} but {len(self.ids)} cutouts x {ppi} patches "
+                f"= {len(self.ids) * ppi}; {what} and dataset are from different runs")
+        if np.issubdtype(np.dtype(dtype), np.integer):
+            info = np.iinfo(dtype)
+            if values.min() < info.min or values.max() > info.max:
+                raise ValueError(
+                    f"{what} outside {dtype}: [{values.min()}, {values.max()}]")
+        return pa.FixedSizeListArray.from_arrays(pa.array(values.astype(dtype)), ppi)
+
+    def save_cluster_labels(self, path, labels, patch_size, entropy=None):
         """Write per-cutout cluster labels to parquet, keyed by image_id.
 
         Clustering output is a flat per-patch array whose only link to the data is
@@ -297,6 +314,9 @@ class CutoutDataset:
 
         labels : flat per-patch cluster labels in dataset order (e.g. NEMI's
                  ``clusters``).  NaN is stored as -1, matching the noise label.
+        entropy : optional flat per-patch ensemble entropy (NEMI's ``entropy``).
+                  Same positional order as `labels`, so it rides the same join.
+                  Absent for a single-member run.
         """
         if not self.source_info:
             raise ValueError("source_info missing; build with CutoutDataset.from_source")
@@ -307,19 +327,14 @@ class CutoutDataset:
         ppi = (H // patch_size) * (W // patch_size)
 
         labels = np.nan_to_num(np.asarray(labels, dtype="float64"), nan=-1.0).astype("int32")
-        if labels.size != len(self.ids) * ppi:
-            raise ValueError(
-                f"{labels.size} labels but {len(self.ids)} cutouts x {ppi} patches "
-                f"= {len(self.ids) * ppi}; labels and dataset are from different runs")
-        lo, hi = np.iinfo("int16").min, np.iinfo("int16").max
-        if labels.min() < lo or labels.max() > hi:
-            raise ValueError(f"labels outside int16: [{labels.min()}, {labels.max()}]")
-
-        table = pa.table({
+        columns = {
             "image_id": pa.array(self.ids, type=pa.string()),
-            "labels": pa.FixedSizeListArray.from_arrays(
-                pa.array(labels.astype("int16")), ppi),
-        })
+            "labels": self._per_patch(labels, ppi, "int16", "labels"),
+        }
+        if entropy is not None:
+            columns["entropy"] = self._per_patch(entropy, ppi, "float32",
+                                                 "entropy values")
+        table = pa.table(columns)
         table = table.replace_schema_metadata({b"dbof": json.dumps({
             "patch_size": patch_size,
             "patches_per_cutout": ppi,
