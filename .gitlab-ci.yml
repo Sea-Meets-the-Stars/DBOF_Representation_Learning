@@ -1,0 +1,31 @@
+# Builds the cuML + PyTorch image on NRP and pushes it to this project's
+# registry.  Runs on every push; the conda layer is cached, so a source-only
+# change rebuilds in minutes.
+#
+# $CI_REGISTRY_IMAGE resolves to gitlab-registry.nrp-nautilus.io/<group>/<project>,
+# so the image address is never hardcoded here.
+#
+# Jobs should reference the :<short-sha> tag rather than :latest, so a run can
+# always be traced back to the commit that built its environment.
+image: ghcr.io/osscontainertools/kaniko:debug
+
+stages:
+  - build-and-push
+
+build-and-push-job:
+  stage: build-and-push
+  # A cold RAPIDS solve plus a ~15 GB push exceeds GitLab's 60 min default.
+  # The runner's own timeout still caps this.
+  timeout: 3h
+  variables:
+    # Kaniko's HTTP/2 client is pathologically slow pushing to this GitLab.
+    GODEBUG: "http2client=0"
+  script:
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"$CI_REGISTRY_USER\",\"password\":\"$CI_REGISTRY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+    - /kaniko/executor
+      --cache=true
+      --push-retry=10
+      --context $CI_PROJECT_DIR
+      --dockerfile $CI_PROJECT_DIR/Dockerfile
+      --destination $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+      --destination $CI_REGISTRY_IMAGE:latest

@@ -1,0 +1,13 @@
+# COPY . pulls the build context into the image; keep it to source.
+.venv*
+.git
+.idea
+build/
+notebooks/
+tests/
+**/__pycache__/
+*.ipynb
+*.parquet
+*.npz
+Dockerfile
+.dockerignore
