@@ -110,7 +110,7 @@ def _download(source, subset, subsample_per_chunk, num_sample_chunks, n_workers,
     port = client.scheduler_info()["services"]["dashboard"]
     print(f"nrp link url : https://jupyterhub-west.nrp-nautilus.io/hub/user-redirect/proxy/{port}/status")
 
-    images_da, ids_da, valid_mask_da = source.full_dataset_as_dask()
+    images_da, ids_da, _ = source.full_dataset_as_dask()
     ids_np = np.asarray(ids_da.compute())
 
     if metadata is None:
@@ -123,7 +123,8 @@ def _download(source, subset, subsample_per_chunk, num_sample_chunks, n_workers,
         in_meta.append(_as_str(ids_np[i]) in known)
 
     # uncorrupted data and data written to meta.
-    valid_idx = np.flatnonzero(np.asarray(valid_mask_da) & np.asarray(in_meta))
+    valid_idx = np.flatnonzero((ids_np != b"") & np.asarray(in_meta))
+
     images_da, ids_np = images_da[valid_idx], ids_np[valid_idx]
 
     if subset:
