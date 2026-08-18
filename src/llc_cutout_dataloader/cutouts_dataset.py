@@ -104,23 +104,33 @@ def chunk_aware_subsample(da, num_sample_chunks, subsample_per_chunk, chunk=1020
     return np.sort(np.concatenate(idx))
 
 
-def _download(source, subset, subsample_per_chunk, num_sample_chunks, n_workers):
+def _download(source, subset, subsample_per_chunk, num_sample_chunks, n_workers, metadata=None):
     client = Client(n_workers=n_workers)
     print(client)
     port = client.scheduler_info()["services"]["dashboard"]
     print(f"nrp link url : https://jupyterhub-west.nrp-nautilus.io/hub/user-redirect/proxy/{port}/status")
 
     images_da, ids_da, valid_mask_da = source.full_dataset_as_dask()
+    ids_np = np.asarray(ids_da.compute())
 
-    # drop empty store slots (rejected cutouts / failed steps)
-    valid_idx = np.flatnonzero(np.asarray(valid_mask_da))
-    images_da, ids_da = images_da[valid_idx], ids_da[valid_idx]
+    if metadata is None:
+        metadata = source.read_metadata()
+    known = set(metadata.index)
+
+    # filter out ids missing from the metadata. This happens if a run crashes midway through or some other corruption
+    in_meta = []
+    for i in range(len(ids_np)):
+        in_meta.append(_as_str(ids_np[i]) in known)
+
+    # uncorrupted data and data written to meta.
+    valid_idx = np.flatnonzero(np.asarray(valid_mask_da) & np.asarray(in_meta))
+    images_da, ids_np = images_da[valid_idx], ids_np[valid_idx]
 
     if subset:
         subset_idxs = chunk_aware_subsample(images_da, num_sample_chunks, subsample_per_chunk)
-        images_da, ids_da = images_da[subset_idxs], ids_da[subset_idxs]
+        images_da, ids_np = images_da[subset_idxs], ids_np[subset_idxs]
 
-    return images_da.compute(), np.asarray(ids_da.compute())   # aligned
+    return images_da.compute(), ids_np  # aligned
 
 
 def _filter_invalid(images_np, ids_np, channel_names):
@@ -196,12 +206,16 @@ class CutoutDataset:
         if data_channels is None:
             raise ValueError("pass data_channels; see source.print_available_channels()")
 
-        images, ids = _download(source, subset, subsample_per_chunk, num_sample_chunks, n_workers)
+        metadata = source.read_metadata()
+
+        images, ids = _download(source, subset, subsample_per_chunk, num_sample_chunks, n_workers, metadata)
         images, ids = _filter_invalid(images, ids, source.channel_names)
+
         X, coords, mean, std = _split_channels(
             images, source.channel_names, data_channels, coord_channels)
         print(f"features {list(data_channels)} | coords {list(coord_channels)}")
-        return cls(X, coords, [_as_str(i) for i in ids], source.read_metadata(),
+
+        return cls(X, coords, [_as_str(i) for i in ids], metadata,
                    list(data_channels), list(coord_channels), mean, std,
                    source_info=source.source_info)
 

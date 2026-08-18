@@ -1,0 +1,357 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..1ecc003
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,29 @@
++"""Test the working tree, not an installed copy.
++
++The package is normally pip-installed non-editable, so a bare import would
++resolve to site-packages and silently skip local edits.
++"""
++import sys
++from pathlib import Path
++
++import pytest
++
++SRC = Path(__file__).resolve().parents[1] / "src"
++sys.path.insert(0, str(SRC))
++
++
++class _StubClient:
++    """Stands in for distributed.Client: _download only reads the dashboard port."""
++
++    def __init__(self, *args, **kwargs):
++        pass
++
++    def scheduler_info(self):
++        return {"services": {"dashboard": 0}}
++
++
++@pytest.fixture(autouse=True)
++def no_dask_cluster(monkeypatch):
++    """Keep _download from spawning a real scheduler + worker processes."""
++    import llc_cutout_dataloader.cutouts_dataset as cutouts_dataset
++    monkeypatch.setattr(cutouts_dataset, "Client", _StubClient)
+diff --git a/tests/synthetic_cutouts.py b/tests/synthetic_cutouts.py
+new file mode 100644
+index 0000000..0460a71
+--- /dev/null
++++ b/tests/synthetic_cutouts.py
+@@ -0,0 +1,123 @@
++"""Local stand-ins for a cutout dataset on S3.
++
++The image store is a real zarr group with the production layout written by
++``dbof``'s ``ZarrDataset`` -- (N, C, H, W) images and (N,) ``S32`` image_ids,
++one chunk per cutout -- and the metadata is real parquet written by dbof's
++``MetadataWriter``.  Only the S3 filesystem is replaced, so ids come back as
++``numpy.bytes_`` and unwritten slots read as ``b""`` exactly as they do in
++production.
++
++Three kinds of row are modelled, matching what a real store contains:
++
++  written   image + id + metadata row   -- a good cutout
++  orphan    image + id, no metadata row -- crashed before the metadata flushed
++  empty     neither                     -- a cutout rejected at generation time
++"""
++import types
++
++import dask.array as da
++import fsspec
++import numpy as np
++import pandas as pd
++import zarr
++
++import dbof.cutout_dataset_creation.metadata as metadata_mod
++import llc_cutout_dataloader.cutouts_dataset as cutouts_dataset
++
++CHANNELS = ["Theta", "Salt", "SIarea", "XC", "YC"]
++DATA_CHANNELS = ["Theta", "Salt"]
++H = W = 8
++FOLDER = "cutouts"
++RUN_ID = "run0"
++DATASET_NAME = "cutout_dataset.zarr"
++
++
++def image_for(row: int, ice: bool = False, nan: bool = False) -> np.ndarray:
++    """One cutout whose contents identify its row, so alignment is checkable.
++
++    Theta carries the row number, XC/YC carry derived coordinates, and SIarea
++    is ice-free unless asked otherwise.
++    """
++    img = np.zeros((len(CHANNELS), H, W), dtype="float32")
++    img[CHANNELS.index("Theta")] = float(row)
++    img[CHANNELS.index("XC")] = float(row) + 0.5
++    img[CHANNELS.index("YC")] = -float(row) - 0.5
++    if ice:
++        img[CHANNELS.index("SIarea")] = 1.0
++    if nan:
++        img[CHANNELS.index("Salt")] = np.nan
++    return img
++
++
++def row_of(image: np.ndarray) -> int:
++    """Recover the row number an image was built with (inverse of image_for)."""
++    return int(image[DATA_CHANNELS.index("Theta")].flat[0])
++
++
++def row_of_id(image_id) -> int:
++    return int(cutouts_dataset._as_str(image_id).removeprefix("id"))
++
++
++class FakeSource(cutouts_dataset.CutoutDataSource):
++    """CutoutDataSource over local storage.
++
++    ``__init__`` and ``full_dataset_as_dask`` are replaced; ``read_metadata``
++    and ``source_info`` run the production implementations.  Keep
++    ``full_dataset_as_dask`` in step with
++    ``ZarrDatasetReader.full_dataset_as_dask``.
++    """
++
++    def __init__(self, tmp_path, n_written=6, n_orphan=2, n_empty=2,
++                 ice_rows=(), nan_rows=()):
++        # Metadata lives on a memory filesystem keyed by `bucket`, which
++        # create_metadata_reader strips leading slashes from -- so it cannot be
++        # an absolute path.  tmp_path.name keeps each test's tree separate.
++        self.bucket = tmp_path.name
++        self.folder, self.run_id = FOLDER, RUN_ID
++        self.dataset_name, self.s3_endpoint = DATASET_NAME, "local"
++        self.channel_names = list(CHANNELS)
++        self.fs_synch = fsspec.filesystem("memory")
++        self.reader = types.SimpleNamespace(
++            down_sample_res=H, target_km_res=150, channel_names=list(CHANNELS))
++
++        n = n_written + n_orphan + n_empty
++        self.written_rows = list(range(n_written))
++        self.orphan_rows = list(range(n_written, n_written + n_orphan))
++        self.empty_rows = list(range(n_written + n_orphan, n))
++
++        store = zarr.storage.LocalStore(str(tmp_path / self.dataset_name))
++        self._root = zarr.open_group(store=store, mode="a")
++        self._root.attrs["channel_names"] = list(CHANNELS)
++        self._root.attrs["target_km_res"] = 150
++        self._root.attrs["down_sample_res"] = H
++        images = self._root.create_array(
++            "images", shape=(n, len(CHANNELS), H, W),
++            chunks=(1, len(CHANNELS), H, W), dtype="float32")
++        ids = self._root.create_array("image_ids", shape=(n,), chunks=(1,), dtype="S32")
++
++        # Empty rows are left untouched: no chunk is written, so the id reads
++        # back as b"" -- the same state a rejected cutout leaves behind.
++        for row in self.written_rows + self.orphan_rows:
++            images[row] = image_for(row, ice=row in ice_rows, nan=row in nan_rows)
++            ids[row] = f"id{row:02d}".encode("ascii")
++
++        writer = metadata_mod.MetadataWriter(
++            f"{self.bucket}/{self.folder}/{self.run_id}/metadata", fs=self.fs_synch)
++        for row in self.written_rows:
++            writer.add({
++                "image_id": f"id{row:02d}".encode("ascii"),
++                "center_lat": -float(row) - 0.5,
++                "center_lon": float(row) + 0.5,
++                "time_snapshot": pd.Timestamp("2012-01-01") + pd.Timedelta(days=row),
++            })
++        writer.close()
++
++    def full_dataset_as_dask(self):
++        images_da = da.from_zarr(self._root["images"])
++        ids_da = da.from_zarr(self._root["image_ids"])
++        return images_da.rechunk((1024, -1, -1, -1)), ids_da, ids_da != b""
++
++    @property
++    def expected_ids(self):
++        """Ids _download should keep: written and carrying a metadata row."""
++        return [f"id{row:02d}".encode("ascii") for row in self.written_rows]
+diff --git a/tests/test_cutouts_dataset.py b/tests/test_cutouts_dataset.py
+new file mode 100644
+index 0000000..baa6183
+--- /dev/null
++++ b/tests/test_cutouts_dataset.py
+@@ -0,0 +1,187 @@
++"""Tests for the cutout loading path, against a local store (see synthetic_cutouts)."""
++import numpy as np
++import pyarrow.parquet as pq
++import pytest
++
++import llc_cutout_dataloader.cutouts_dataset as cutouts_dataset
++import synthetic_cutouts as synth
++from synthetic_cutouts import DATA_CHANNELS, FakeSource, row_of, row_of_id
++
++
++def _download(source, subset=False, subsample_per_chunk=5, num_sample_chunks=1,
++              metadata=None):
++    return cutouts_dataset._download(
++        source, subset, subsample_per_chunk, num_sample_chunks, n_workers=1,
++        metadata=metadata)
++
++
++# ---------------------------------------------------------------------------
++# _download: which rows survive
++# ---------------------------------------------------------------------------
++
++def test_download_drops_empty_slots_and_orphans(tmp_path):
++    source = FakeSource(tmp_path, n_written=6, n_orphan=2, n_empty=2)
++
++    images, ids = _download(source, metadata=source.read_metadata())
++
++    assert list(ids) == source.expected_ids
++    assert images.shape[0] == 6
++
++
++def test_download_drops_orphans_even_when_no_slot_is_empty(tmp_path):
++    """The orphan filter must not lean on the empty-slot mask to do its work."""
++    source = FakeSource(tmp_path, n_written=4, n_orphan=3, n_empty=0)
++
++    _, ids = _download(source, metadata=source.read_metadata())
++
++    assert list(ids) == source.expected_ids
++
++
++def test_download_reads_metadata_when_not_supplied(tmp_path):
++    source = FakeSource(tmp_path, n_written=3, n_orphan=2, n_empty=1)
++
++    _, ids = _download(source, metadata=None)
++
++    assert list(ids) == source.expected_ids
++
++
++# ---------------------------------------------------------------------------
++# _download: images stay aligned to ids
++# ---------------------------------------------------------------------------
++
++def test_download_keeps_ids_aligned_to_images(tmp_path):
++    source = FakeSource(tmp_path, n_written=6, n_orphan=2, n_empty=2)
++
++    images, ids = _download(source, metadata=source.read_metadata())
++
++    theta = synth.CHANNELS.index("Theta")
++    for image, image_id in zip(images, ids):
++        assert int(image[theta].flat[0]) == row_of_id(image_id)
++
++
++def test_download_subset_keeps_ids_aligned_to_images(tmp_path):
++    """Regression: the subset branch once re-indexed the *unfiltered* id array."""
++    source = FakeSource(tmp_path, n_written=6, n_orphan=2, n_empty=2)
++
++    images, ids = _download(source, subset=True, subsample_per_chunk=4,
++                            num_sample_chunks=1, metadata=source.read_metadata())
++
++    assert images.shape[0] == len(ids) == 4
++    theta = synth.CHANNELS.index("Theta")
++    for image, image_id in zip(images, ids):
++        assert int(image[theta].flat[0]) == row_of_id(image_id)
++        assert image_id in source.expected_ids
++
++
++# ---------------------------------------------------------------------------
++# _filter_invalid
++# ---------------------------------------------------------------------------
++
++def test_filter_invalid_drops_ice_and_nan_and_keeps_alignment(tmp_path):
++    source = FakeSource(tmp_path, n_written=6, n_orphan=0, n_empty=0,
++                        ice_rows=(1,), nan_rows=(3,))
++    images, ids = _download(source, metadata=source.read_metadata())
++
++    kept_images, kept_ids = cutouts_dataset._filter_invalid(
++        images, ids, source.channel_names)
++
++    assert [row_of_id(i) for i in kept_ids] == [0, 2, 4, 5]
++    theta = synth.CHANNELS.index("Theta")
++    for image, image_id in zip(kept_images, kept_ids):
++        assert int(image[theta].flat[0]) == row_of_id(image_id)
++
++
++# ---------------------------------------------------------------------------
++# from_source
++# ---------------------------------------------------------------------------
++
++def test_from_source_ids_are_all_present_in_metadata(tmp_path):
++    """The invariant a downstream label join depends on: every id resolves."""
++    source = FakeSource(tmp_path, n_written=6, n_orphan=3, n_empty=2)
++
++    dataset = cutouts_dataset.CutoutDataset.from_source(
++        source=source, data_channels=DATA_CHANNELS, subset=False)
++
++    assert set(dataset.ids) <= set(dataset.metadata.index)
++    assert len(dataset.ids) == 6
++
++
++def test_from_source_keeps_requested_channels_and_separates_coords(tmp_path):
++    source = FakeSource(tmp_path, n_written=4, n_orphan=0, n_empty=0)
++
++    dataset = cutouts_dataset.CutoutDataset.from_source(
++        source=source, data_channels=DATA_CHANNELS, subset=False)
++
++    assert dataset.channel_names == DATA_CHANNELS
++    assert dataset.X.shape == (4, len(DATA_CHANNELS), synth.H, synth.W)
++    assert dataset.coords.shape == (4, 2, synth.H, synth.W)
++    for row, image in enumerate(dataset.X):
++        assert row_of(image) == row
++    xc = dataset.coords[:, dataset.coord_names.index("XC")]
++    assert np.allclose(xc[:, 0, 0], np.arange(4) + 0.5)
++
++
++def test_from_source_rejects_unknown_channel(tmp_path):
++    source = FakeSource(tmp_path, n_written=2, n_orphan=0, n_empty=0)
++
++    with pytest.raises(ValueError, match="channels not in dataset"):
++        cutouts_dataset.CutoutDataset.from_source(
++            source=source, data_channels=["Theta", "Nope"], subset=False)
++
++
++def test_patch_times_resolve_for_every_patch(tmp_path):
++    """get_patch_times reindexes metadata by id; an unjoinable id yields NaT."""
++    source = FakeSource(tmp_path, n_written=4, n_orphan=2, n_empty=0)
++    dataset = cutouts_dataset.CutoutDataset.from_source(
++        source=source, data_channels=DATA_CHANNELS, subset=False)
++
++    times = dataset.get_patch_times(patch_size=4)
++
++    assert len(times) == 4 * 4          # 4 cutouts x 4 patches
++    assert not np.isnat(times).any()
++
++
++# ---------------------------------------------------------------------------
++# label round-trip (what a downstream consumer joins against)
++# ---------------------------------------------------------------------------
++
++def test_save_cluster_labels_keys_every_row_to_metadata(tmp_path):
++    source = FakeSource(tmp_path, n_written=4, n_orphan=2, n_empty=1)
++    dataset = cutouts_dataset.CutoutDataset.from_source(
++        source=source, data_channels=DATA_CHANNELS, subset=False)
++    patch_size = 4
++    ppi = (synth.H // patch_size) * (synth.W // patch_size)
++    out = tmp_path / "labels.parquet"
++
++    dataset.save_cluster_labels(str(out), np.arange(len(dataset.ids) * ppi), patch_size)
++
++    table = pq.read_table(out)
++    assert set(table.column("image_id").to_pylist()) <= set(dataset.metadata.index)
++    assert table.num_rows == len(dataset.ids)
++    assert len(table.column("labels")[0]) == ppi
++
++
++def test_save_cluster_labels_rejects_mismatched_label_count(tmp_path):
++    source = FakeSource(tmp_path, n_written=3, n_orphan=0, n_empty=0)
++    dataset = cutouts_dataset.CutoutDataset.from_source(
++        source=source, data_channels=DATA_CHANNELS, subset=False)
++
++    with pytest.raises(ValueError, match="different runs"):
++        dataset.save_cluster_labels(str(tmp_path / "bad.parquet"),
++                                    np.arange(5), patch_size=4)
++
++
++# ---------------------------------------------------------------------------
++# subsampling helper
++# ---------------------------------------------------------------------------
++
++def test_chunk_aware_subsample_stays_in_range(tmp_path):
++    source = FakeSource(tmp_path, n_written=6, n_orphan=0, n_empty=0)
++    images_da, _, _ = source.full_dataset_as_dask()
++
++    idx = cutouts_dataset.chunk_aware_subsample(
++        images_da, num_sample_chunks=1, subsample_per_chunk=5)
++
++    assert idx.size == 5
++    assert idx.min() >= 0 and idx.max() < images_da.shape[0]
++    assert (np.diff(idx) >= 0).all()
