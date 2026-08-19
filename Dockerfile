@@ -44,8 +44,15 @@ RUN conda config --set remote_connect_timeout_secs 60 \
 # only to keep the package cache and temp files out of the layer we keep, and an
 # image-wide TMPDIR would point at a directory this RUN deletes.  libmamba does
 # not create TMPDIR itself, hence the mkdir.
+#
+# CONDA_OVERRIDE_CUDA fakes the __cuda virtual package.  Conda derives __cuda
+# from the host's NVIDIA driver; this builder has no GPU, so every CUDA build of
+# pytorch and cupy is otherwise rejected as uninstallable.  (The shell script
+# never needed this -- it ran on a JupyterHub GPU node.)  12.0 is the floor
+# these packages ask for, which keeps the image runnable on the widest range of
+# driver versions; raise it if the solve reports a higher __cuda requirement.
 RUN mkdir -p /tmp/conda_pkgs /tmp/conda_tmp \
- && export CONDA_PKGS_DIRS=/tmp/conda_pkgs TMPDIR=/tmp/conda_tmp \
+ && export CONDA_PKGS_DIRS=/tmp/conda_pkgs TMPDIR=/tmp/conda_tmp CONDA_OVERRIDE_CUDA=12.0 \
  && mamba create -p ${ENV_PREFIX} -y \
       -c rapidsai -c conda-forge -c nvidia \
       python=${PY_VER} "cuda-version=12.*" \
