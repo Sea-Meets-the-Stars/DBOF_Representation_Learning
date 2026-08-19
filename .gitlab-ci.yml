@@ -20,11 +20,18 @@ build-and-push-job:
   variables:
     # Kaniko's HTTP/2 client is pathologically slow pushing to this GitLab.
     GODEBUG: "http2client=0"
+    # The conda env is ~12 GB and kaniko snapshots the whole filesystem in
+    # memory after each RUN, which OOM-killed the default-sized runner pod.
+    # Ignored if this runner does not allow resource overwrites.
+    KUBERNETES_MEMORY_REQUEST: "16Gi"
+    KUBERNETES_MEMORY_LIMIT: "24Gi"
   script:
     - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"$CI_REGISTRY_USER\",\"password\":\"$CI_REGISTRY_PASSWORD\"}}}" > /kaniko/.docker/config.json
     - /kaniko/executor
       --cache=true
       --push-retry=10
+      --compressed-caching=false
+      --snapshot-mode=redo
       --context $CI_PROJECT_DIR
       --dockerfile $CI_PROJECT_DIR/Dockerfile
       --destination $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
