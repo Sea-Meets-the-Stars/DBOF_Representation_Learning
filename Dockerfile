@@ -15,12 +15,23 @@ ARG PY_VER=3.12
 ARG ENV_PREFIX=/opt/conda_envs/main_cuml
 ARG TARGET_TRIPLE=targets/x86_64-linux
 ARG DBOF_URL=https://github.com/Sea-Meets-the-Stars/llc4320-native-grid-preprocessing.git
-ARG DBOF_REF=cutouts_data_v2
+ARG DBOF_REF=main
 ARG NEMI_URL=https://github.com/CompClimate/NEMI.git
-ARG NEMI_REF=GPU-workflow
+ARG NEMI_REF=speed_up_assess_overlap
 
+# CONDA_PKGS_DIRS and CONDA_OVERRIDE_CUDA are safe to leave in the image -- no
+# conda runs at container start.  TMPDIR is not: it is exported per step below,
+# because an image-wide TMPDIR would point at a directory those steps delete.
+#
+# CONDA_OVERRIDE_CUDA fakes the __cuda virtual package.  Conda derives __cuda
+# from the host's NVIDIA driver; this builder has no GPU, so every CUDA build of
+# cupy and cuml is otherwise rejected as uninstallable.  12.0 is the floor these
+# packages ask for, which keeps the image runnable on the widest range of driver
+# versions.
 ENV DEBIAN_FRONTEND=noninteractive \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    CONDA_PKGS_DIRS=/tmp/conda_pkgs \
+    CONDA_OVERRIDE_CUDA=12.0
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates \
@@ -33,36 +44,57 @@ RUN conda config --set remote_connect_timeout_secs 60 \
  && conda config --set remote_backoff_factor 2
 
 # ---------------------------------------------------------------------------
-# The env.  Spec list copied verbatim from the script, including the pins:
+# The env, installed in stages.  The pins are the script's:
 #   numpy<2.5        -> numba (via cuml) ceiling
 #   scikit-learn=1.5 -> cuml 25.06 sklearn-compat shim
 #   cuml=25.06       -> GPU agglomerative takes `n_neighbors`, renamed to `c`
 #                       after 25.08
 #   cuda-*-dev/cccl/nvrtc -> headers cupy needs to JIT-compile kernels
-# ---------------------------------------------------------------------------
-# CONDA_PKGS_DIRS/TMPDIR are exported here rather than set as ENV: they exist
-# only to keep the package cache and temp files out of the layer we keep, and an
-# image-wide TMPDIR would point at a directory this RUN deletes.  libmamba does
-# not create TMPDIR itself, hence the mkdir.
 #
-# CONDA_OVERRIDE_CUDA fakes the __cuda virtual package.  Conda derives __cuda
-# from the host's NVIDIA driver; this builder has no GPU, so every CUDA build of
-# pytorch and cupy is otherwise rejected as uninstallable.  (The shell script
-# never needed this -- it ran on a JupyterHub GPU node.)  12.0 is the floor
-# these packages ask for, which keeps the image runnable on the widest range of
-# driver versions; raise it if the solve reports a higher __cuda requirement.
-RUN mkdir -p /tmp/conda_pkgs /tmp/conda_tmp \
- && export CONDA_PKGS_DIRS=/tmp/conda_pkgs TMPDIR=/tmp/conda_tmp CONDA_OVERRIDE_CUDA=12.0 \
+# One combined `mamba create` produced a single ~6 GB layer, and that blob could
+# not finish uploading before the registry token expired -- a 74-minute attempt
+# died with UNAUTHORIZED mid-PATCH.  Staged installs produce several smaller
+# blobs, each authenticated and retried on its own.  Every step must clean its
+# own package cache: deleting it in a later layer leaves the bytes in the
+# earlier one.  libmamba does not create TMPDIR itself, hence each mkdir.
+# ---------------------------------------------------------------------------
+RUN mkdir -p /tmp/conda_pkgs /tmp/conda_tmp && export TMPDIR=/tmp/conda_tmp \
  && mamba create -p ${ENV_PREFIX} -y \
       -c rapidsai -c conda-forge -c nvidia \
       python=${PY_VER} "cuda-version=12.*" \
-      cuml=25.06 cupy \
       cuda-cudart-dev cuda-cccl cuda-nvrtc \
-      pytorch-gpu torchvision \
       "numpy<2.5" "scikit-learn=1.5.*" \
-      zarr s3fs xarray dask ipykernel matplotlib \
- && conda clean --all -y \
- && rm -rf /tmp/conda_pkgs /tmp/conda_tmp
+ && conda clean --all -y && rm -rf /tmp/conda_pkgs /tmp/conda_tmp
+
+# cupy before cuml so the shared CUDA math libraries (cublas, cusolver,
+# cusparse, cufft, curand) land here rather than swelling the cuml layer.
+RUN mkdir -p /tmp/conda_pkgs /tmp/conda_tmp && export TMPDIR=/tmp/conda_tmp \
+ && mamba install -p ${ENV_PREFIX} -y \
+      -c rapidsai -c conda-forge -c nvidia cupy \
+ && conda clean --all -y && rm -rf /tmp/conda_pkgs /tmp/conda_tmp
+
+# The largest remaining step: cuml drags in libcuvs, libcudf, nccl and friends.
+RUN mkdir -p /tmp/conda_pkgs /tmp/conda_tmp && export TMPDIR=/tmp/conda_tmp \
+ && mamba install -p ${ENV_PREFIX} -y \
+      -c rapidsai -c conda-forge -c nvidia cuml=25.06 \
+ && conda clean --all -y && rm -rf /tmp/conda_pkgs /tmp/conda_tmp
+
+# CPU torch: this image runs NEMI, whose GPU work is cuml and cupy.  torch is
+# only imported for tensor conversion in the cutout loader, so the CUDA build
+# (libtorch cuda, libcudnn, libmagma, triton) is ~2 GB of dead weight.  Model
+# training needs a different image.
+RUN mkdir -p /tmp/conda_pkgs /tmp/conda_tmp && export TMPDIR=/tmp/conda_tmp \
+ && mamba install -p ${ENV_PREFIX} -y \
+      -c rapidsai -c conda-forge -c nvidia pytorch-cpu \
+ && conda clean --all -y && rm -rf /tmp/conda_pkgs /tmp/conda_tmp
+
+# matplotlib-base, not matplotlib: NEMI imports pyplot at module level, but the
+# meta-package's Qt stack (qt6-main, pyside6, libclang) is unusable in a job.
+RUN mkdir -p /tmp/conda_pkgs /tmp/conda_tmp && export TMPDIR=/tmp/conda_tmp \
+ && mamba install -p ${ENV_PREFIX} -y \
+      -c rapidsai -c conda-forge -c nvidia \
+      zarr s3fs xarray dask ipykernel matplotlib-base \
+ && conda clean --all -y && rm -rf /tmp/conda_pkgs /tmp/conda_tmp
 
 # Containers start without `conda activate`, so put the env on PATH instead.
 # CUDA_PATH replaces the script's sitecustomize.py: cupy needs it to find the
@@ -75,7 +107,9 @@ RUN pip install --no-deps "dbof-in-native-grid @ git+${DBOF_URL}@${DBOF_REF}"
 
 # umap-learn<0.5.7 for NEMI: 0.5.7+ calls sklearn 1.6's ensure_all_finite, but
 # cuML pins scikit-learn to 1.5.x here.  (Also brings tqdm/pynndescent.)
-RUN pip install einops timm==0.3.2 xmitgcm torchinfo "umap-learn<0.5.7"
+# timm and torchinfo are dropped with the DL training scope -- timm requires
+# torchvision, which pip would install as a CUDA build over the CPU torch above.
+RUN pip install einops xmitgcm "umap-learn<0.5.7"
 
 # NEMI, for GPU cuML UMAP + clustering.  Base install only (no [gpu] extra):
 # its cupy-cuda12x would clash with conda's cupy.
@@ -84,7 +118,7 @@ RUN git clone --branch ${NEMI_REF} --depth 1 ${NEMI_URL} /opt/git/NEMI \
 
 # This repo (llc_cutout_dataloader + visualization).  --no-deps for the same
 # reason as dbof: its pyproject pins torch==2.8.0, and letting pip honour that
-# would replace conda's pytorch-gpu with a PyPI wheel.  Last layer, since this
+# would replace conda's CPU torch with a PyPI wheel.  Last layer, since this
 # is the source that changes most often.
 COPY . /opt/src/fronts
 RUN pip install --no-deps /opt/src/fronts
