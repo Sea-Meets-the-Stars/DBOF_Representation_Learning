@@ -19,10 +19,7 @@ ARG DBOF_REF=cutouts_data_v2
 ARG NEMI_URL=https://github.com/CompClimate/NEMI.git
 ARG NEMI_REF=GPU-workflow
 
-# Keep conda's cache and temp off the image layers we keep.
-ENV CONDA_PKGS_DIRS=/tmp/conda_pkgs \
-    TMPDIR=/tmp/conda_tmp \
-    DEBIAN_FRONTEND=noninteractive \
+ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update \
@@ -43,7 +40,13 @@ RUN conda config --set remote_connect_timeout_secs 60 \
 #                       after 25.08
 #   cuda-*-dev/cccl/nvrtc -> headers cupy needs to JIT-compile kernels
 # ---------------------------------------------------------------------------
-RUN mamba create -p ${ENV_PREFIX} -y \
+# CONDA_PKGS_DIRS/TMPDIR are exported here rather than set as ENV: they exist
+# only to keep the package cache and temp files out of the layer we keep, and an
+# image-wide TMPDIR would point at a directory this RUN deletes.  libmamba does
+# not create TMPDIR itself, hence the mkdir.
+RUN mkdir -p /tmp/conda_pkgs /tmp/conda_tmp \
+ && export CONDA_PKGS_DIRS=/tmp/conda_pkgs TMPDIR=/tmp/conda_tmp \
+ && mamba create -p ${ENV_PREFIX} -y \
       -c rapidsai -c conda-forge -c nvidia \
       python=${PY_VER} "cuda-version=12.*" \
       cuml=25.06 cupy \
