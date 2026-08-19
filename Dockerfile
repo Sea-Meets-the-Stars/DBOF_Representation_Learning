@@ -66,6 +66,14 @@ RUN mkdir -p /tmp/conda_pkgs /tmp/conda_tmp && export TMPDIR=/tmp/conda_tmp \
       "numpy<2.5" "scikit-learn=1.5.*" \
  && conda clean --all -y && rm -rf /tmp/conda_pkgs /tmp/conda_tmp
 
+# A spec only constrains the command that names it, so `pytorch-cpu` was free to
+# drag cuml 25.06 -> 25.10 (and dask, cudf, libcuvs with it).  conda-meta/pinned
+# is honoured by every later install into this prefix, which is what keeps the
+# documented ceilings -- cuml <=25.08 for the agglomerative `n_neighbors`
+# keyword, numpy <2.5 for numba, scikit-learn 1.5 for cuml's sklearn shim.
+# Its own layer, so adding a pin does not rebuild the base env.
+RUN printf 'cuml 25.06.*\nnumpy <2.5\nscikit-learn 1.5.*\n' >> ${ENV_PREFIX}/conda-meta/pinned
+
 # cupy before cuml so the shared CUDA math libraries (cublas, cusolver,
 # cusparse, cufft, curand) land here rather than swelling the cuml layer.
 RUN mkdir -p /tmp/conda_pkgs /tmp/conda_tmp && export TMPDIR=/tmp/conda_tmp \
