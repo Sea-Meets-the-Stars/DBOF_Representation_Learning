@@ -1,0 +1,59 @@
+# Smoke test for the cuML + PyTorch image: the first point in the pipeline where
+# a real GPU is involved.  Run this before any NEMI job on a new image tag.
+#
+#   kubectl apply -f jobs/verify-gpu.yaml
+#   kubectl logs -f job/verify-gpu
+#
+# Re-running needs `kubectl delete job verify-gpu` first: a Job's pod template
+# is immutable.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: verify-gpu
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600      # job object self-deletes an hour after finishing
+  template:
+    spec:
+      restartPolicy: Never
+      # cuML 25.06 on CUDA 12.9 will not run on the cluster's Pascal-era cards
+      # (GTX 1080 Ti, TITAN Xp -- compute capability 6.1), and it fails only
+      # after the pod has pulled several GB, so restrict placement up front.
+      #
+      # Everything listed is Ampere or newer (cc >= 8.0).  A10 and A100 are the
+      # models verified to work; the rest are the same generation or later and
+      # are included for availability -- A10 alone left the pod Pending, and
+      # every A100 node currently advertises 0 allocatable GPUs.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A10
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-A100-PCIE-40GB
+                      - NVIDIA-A100-80GB-PCIe
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-A40
+                      - NVIDIA-L4
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+      containers:
+        - name: verify
+          image: gitlab-registry.nrp-nautilus.io/jaketall/nemi_fronts:c530a26e
+          command: ["python", "/opt/src/fronts/verify_gpu.py"]
+          resources:                  # GPU requests and limits must match exactly
+            requests:
+              cpu: "2"
+              memory: 8Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "2"
+              memory: 8Gi
+              nvidia.com/gpu: "1"
