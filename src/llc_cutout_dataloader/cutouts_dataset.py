@@ -180,6 +180,47 @@ class _CutoutTorch(Dataset):
         return self.X[i], self.ids[i]
 
 
+class RawCutouts:
+    """Downloaded cutouts with every source channel retained.
+
+    Channel selection is what makes a CutoutDataset, and it is cheap; the
+    download is not.  Holding the full stack here lets a feature set be swapped
+    with ``select`` instead of another download.  Costs the memory of every
+    channel, not just the ones in use.
+    """
+
+    def __init__(self, images, ids, metadata, channel_names, source_info=None):
+        self.images = images                 # (N, C_all, H, W) raw, every source channel
+        self.ids = ids                       # decoded image_id per row, parallel to images
+        self.metadata = metadata             # full df, indexed by image_id
+        self.channel_names = channel_names   # every source channel, coords included
+        self.source_info = source_info or {}
+
+    @classmethod
+    def download(cls, source=None, subset=True, subsample_per_chunk=300,
+                 num_sample_chunks=30, n_workers=8):
+        source = source or CutoutDataSource()
+        metadata = source.read_metadata()
+        images, ids = _download(source, subset, subsample_per_chunk, num_sample_chunks,
+                                n_workers, metadata)
+        images, ids = _filter_invalid(images, ids, source.channel_names)
+        return cls(images, [_as_str(i) for i in ids], metadata,
+                   list(source.channel_names), source.source_info)
+
+    def __len__(self):
+        return len(self.images)
+
+    def select(self, data_channels, coord_channels=("XC", "YC")):
+        """CutoutDataset over the requested channels, without downloading again."""
+        if data_channels is None:
+            raise ValueError(f"pass data_channels; available: {self.channel_names}")
+        X, coords, mean, std = _split_channels(self.images, self.channel_names,
+                                               list(data_channels), list(coord_channels))
+        print(f"features {list(data_channels)} | coords {list(coord_channels)}")
+        return CutoutDataset(X, coords, self.ids, self.metadata, list(data_channels),
+                             list(coord_channels), mean, std, source_info=self.source_info)
+
+
 class CutoutDataset:
     """In-memory cutout dataset: raw feature images X, separate raw coord fields,
     ids, metadata, channel names.  Build with ``CutoutDataset.from_source(...)``.
@@ -203,22 +244,17 @@ class CutoutDataset:
     @classmethod
     def from_source(cls, source=None, data_channels=None, coord_channels=("XC", "YC"),
                     subset=True, subsample_per_chunk=300, num_sample_chunks=30, n_workers=8):
-        source = source or CutoutDataSource()
+        """Download and select in one step.
+
+        Swapping feature sets this way re-downloads.  To try several, download
+        once with ``RawCutouts.download`` and call ``select`` per feature set.
+        """
         if data_channels is None:
             raise ValueError("pass data_channels; see source.print_available_channels()")
-
-        metadata = source.read_metadata()
-
-        images, ids = _download(source, subset, subsample_per_chunk, num_sample_chunks, n_workers, metadata)
-        images, ids = _filter_invalid(images, ids, source.channel_names)
-
-        X, coords, mean, std = _split_channels(
-            images, source.channel_names, data_channels, coord_channels)
-        print(f"features {list(data_channels)} | coords {list(coord_channels)}")
-
-        return cls(X, coords, [_as_str(i) for i in ids], metadata,
-                   list(data_channels), list(coord_channels), mean, std,
-                   source_info=source.source_info)
+        raw = RawCutouts.download(source, subset=subset,
+                                  subsample_per_chunk=subsample_per_chunk,
+                                  num_sample_chunks=num_sample_chunks, n_workers=n_workers)
+        return raw.select(data_channels, coord_channels)
 
     def __len__(self):
         return len(self.X)

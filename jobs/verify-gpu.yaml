@@ -12,7 +12,9 @@ metadata:
   name: verify-gpu
 spec:
   backoffLimit: 1
-  ttlSecondsAfterFinished: 3600      # job object self-deletes an hour after finishing
+  # No ttlSecondsAfterFinished on purpose: this job exists to be read, and the
+  # TTL deletes the pod -- and its logs -- whether it passed or failed.  Delete
+  # it by hand once the output has been recorded.
   template:
     spec:
       restartPolicy: Never
