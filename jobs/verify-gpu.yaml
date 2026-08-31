@@ -48,7 +48,7 @@ spec:
                       - NVIDIA-L40S
       containers:
         - name: verify
-          image: gitlab-registry.nrp-nautilus.io/jaketall/nemi_fronts:c530a26e
+          image: gitlab-registry.nrp-nautilus.io/jaketall/nemi_fronts:latest
           envFrom:
             - secretRef:
                 name: dbof-s3

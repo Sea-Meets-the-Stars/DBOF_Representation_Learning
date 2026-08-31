@@ -31,6 +31,11 @@ def _to_patches(images, patch_size):
 
 _GRAD_PREFIX = "grad"      # grad-magnitude channels (gradb2, gradrho2, ...) are log-scaled
 
+OMEGA = 7.2921e-5          # Earth's rotation rate, rad/s
+# Kinematic channels that become Rossby-style ratios when divided by f.
+_DIV_SIGNED = ("relative_vorticity",)   # signed f: cyclonic stays positive in both hemispheres
+_DIV_ABS = ("strain_n", "strain_s", "strain_mag", "divergence")   # |f|: strain stays positive, convergence stays convergence
+
 
 def _safe_log10(a):
     """log10 with a positive floor so exact-zero gradients don't produce -inf."""
@@ -277,11 +282,46 @@ class CutoutDataset:
                 X[:, i] = _safe_log10(X[:, i])
         return X
 
-    def preprocess_for_training(self, X=None):
-        """Full training transform: log-scale the gradient fields, then z-score.
-        Order matters -- the z-score stats are computed on the logged data."""
+    def _coriolis(self, equator_deg):
+        """Signed f per pixel, (N, H, W), with |f| floored at its equator_deg value.
+
+        Uses the coriolis_f channel when it was selected, otherwise 2*OMEGA*sin(YC).
+        The floor keeps the tropics finite -- f goes to zero at the equator, and the
+        kinematic channels would otherwise be divided by ~0."""
+        if "coriolis_f" in self.channel_names:
+            f = self.X[:, self.channel_names.index("coriolis_f")]
+        else:
+            f = 2 * OMEGA * np.sin(np.deg2rad(self.coords[:, self.coord_names.index("YC")]))
+        floor = 2 * OMEGA * np.sin(np.deg2rad(equator_deg))
+        return np.where(f < 0, -1.0, 1.0) * np.maximum(np.abs(f), floor)
+
+    def _divided_by_f(self, X=None, equator_deg=5.0):
+        """Divide the kinematic channels by the Coriolis parameter: vorticity by
+        signed f, strain and divergence by |f|.  Other channels pass through
+        unchanged.  Returns a copy."""
+        X = (self.X if X is None else X).astype("float32", copy=True)
+        f = self._coriolis(equator_deg)
+        for i, c in enumerate(self.channel_names):
+            if c in _DIV_SIGNED:
+                X[:, i] /= f
+            elif c in _DIV_ABS:
+                X[:, i] /= np.abs(f)
+        return X
+
+    def preprocess_for_training(self, X=None, div_by_f=False, equator_deg=5.0):
+        """Full training transform: log-scale the gradient fields, optionally divide
+        the kinematic channels by f, then z-score.
+        Order matters -- the z-score stats are computed on the transformed data.
+
+        div_by_f turns vorticity, strain and divergence into Rossby-style ratios, so
+        one value means the same dynamics at every latitude; left off, those channels
+        carry f's latitude dependence and latitude becomes an embedding coordinate.
+        equator_deg sets the latitude whose |f| floors the divisor."""
         X = self.X if X is None else X
-        return self._normalized(self._log_gradients(X))
+        X = self._log_gradients(X)
+        if div_by_f:
+            X = self._divided_by_f(X, equator_deg)
+        return self._normalized(X)
 
     def get_patches(self, patch_size, flatten=True, preproc=True):
         """Feature patches for clustering.
