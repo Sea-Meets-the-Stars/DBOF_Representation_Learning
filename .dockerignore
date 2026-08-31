@@ -11,3 +11,4 @@ tests/
 *.npz
 Dockerfile
 .dockerignore
+s3.env

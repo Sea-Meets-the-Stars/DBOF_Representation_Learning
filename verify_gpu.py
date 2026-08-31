@@ -11,6 +11,7 @@ import sklearn
 import torch
 import umap
 import nemi
+import s3fs
 
 print("python       ", sys.version.split()[0])
 print("numpy        ", numpy.__version__)
@@ -20,3 +21,7 @@ print("nemi         ", getattr(nemi, "__version__", "ok"))
 print("torch cuda   ", torch.cuda.is_available())
 print("cupy         ", cupy.__version__, "| jit:", int((cupy.arange(5) * 2).sum()))  # 20
 print("cuml         ", cuml.__version__)
+
+print("s3 objects   ", len(s3fs.S3FileSystem(
+    client_kwargs={"endpoint_url": "https://s3-west.nrp-nautilus.io"}
+).ls("dbof/cutouts_dataset_v2/2_02")))

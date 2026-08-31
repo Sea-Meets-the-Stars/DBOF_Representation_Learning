@@ -49,6 +49,9 @@ spec:
       containers:
         - name: verify
           image: gitlab-registry.nrp-nautilus.io/jaketall/nemi_fronts:c530a26e
+          envFrom:
+            - secretRef:
+                name: dbof-s3
           command: ["python", "/opt/src/fronts/verify_gpu.py"]
           resources:                  # GPU requests and limits must match exactly
             requests:
