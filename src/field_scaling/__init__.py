@@ -5,8 +5,10 @@ unscaled value means different dynamics at 20 degrees than at 60 and latitude
 leaks into any embedding built on them.  Dividing by f turns them into
 Rossby-style ratios that mean the same thing everywhere.
 
-Kept here rather than in either loader so the cutout and front paths scale the
-same fields; importing it pulls in nothing.
+Kept out of both loaders so the cutout and front paths scale the same fields;
+importing it pulls in nothing.  It is a package rather than a bare module
+under src/ because setuptools' package discovery only installs directories --
+a loose .py is importable from the working tree and missing once installed.
 """
 
 #: Earth's rotation rate, rad/s.

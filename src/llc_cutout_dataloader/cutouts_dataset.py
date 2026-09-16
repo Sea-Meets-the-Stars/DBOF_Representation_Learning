@@ -10,6 +10,9 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from einops import rearrange, reduce
 
+# Shared with fronts_dataloader so both paths scale the same fields.
+from field_scaling import DIV_ABS as _DIV_ABS, DIV_SIGNED as _DIV_SIGNED, OMEGA
+
 
 # Default cutout dataset location (v2 test data).
 DEFAULT_S3_ENDPOINT = "https://s3-west.nrp-nautilus.io"
@@ -30,9 +33,6 @@ def _to_patches(images, patch_size):
 
 
 _GRAD_PREFIX = "grad"      # grad-magnitude channels (gradb2, gradrho2, ...) are log-scaled
-
-# Shared with fronts_dataloader so both paths scale the same fields.
-from field_scaling import DIV_ABS as _DIV_ABS, DIV_SIGNED as _DIV_SIGNED, OMEGA
 
 
 def _safe_log10(a):
