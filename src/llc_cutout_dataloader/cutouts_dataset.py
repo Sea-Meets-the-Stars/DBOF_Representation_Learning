@@ -31,10 +31,8 @@ def _to_patches(images, patch_size):
 
 _GRAD_PREFIX = "grad"      # grad-magnitude channels (gradb2, gradrho2, ...) are log-scaled
 
-OMEGA = 7.2921e-5          # Earth's rotation rate, rad/s
-# Kinematic channels that become Rossby-style ratios when divided by f.
-_DIV_SIGNED = ("relative_vorticity",)   # signed f: cyclonic stays positive in both hemispheres
-_DIV_ABS = ("strain_n", "strain_s", "strain_mag", "divergence")   # |f|: strain stays positive, convergence stays convergence
+# Shared with fronts_dataloader so both paths scale the same fields.
+from field_scaling import DIV_ABS as _DIV_ABS, DIV_SIGNED as _DIV_SIGNED, OMEGA
 
 
 def _safe_log10(a):

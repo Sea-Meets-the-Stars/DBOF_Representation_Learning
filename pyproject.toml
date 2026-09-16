@@ -21,6 +21,13 @@ requires-python = ">=3.12"
 
 dependencies = [
     "dbof-in-native-grid @ git+https://github.com/Sea-Meets-the-Stars/llc4320-native-grid-preprocessing.git@main",
+    "front-finding @ git+https://github.com/Sea-Meets-the-Stars/front-finding.git@main",
+    # ========================================================================
+    # TODO: PIN IS A BRANCH, NOT main.  Switch to @main once the
+    # speed_up_assess_overlap PR is merged.  Until then this ref can move or
+    # be deleted out from under any install, and nothing here is reproducible.
+    # ========================================================================
+    "nemi-learn @ git+https://github.com/CompClimate/NEMI.git@speed_up_assess_overlap",
     "numpy",
     "pandas",
     "scikit-learn",
