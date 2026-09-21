@@ -19,14 +19,14 @@ import pandas as pd
 
 from front_finding.store import FrontStore
 
-from field_scaling import (DIV_ABS, DIV_SIGNED, NORMALISED_EQUIVALENT, OMEGA)
+from field_scaling import (DIV_ABS, DIV_SIGNED, NORMALIZED_EQUIVALENT, OMEGA)
 
 #: Columns that identify a front rather than describe it.  They are carried on
 #: the dataset as ids so a cluster can be traced back, never as features.
 ID_COLUMNS = ("date", "label", "name", "time")
 
 #: Where the front sits on the model grid.  Excluded by default: the bounding
-#: box is an artefact of the raster, and centroid_lat/lon says the same thing
+#: box is an artifact of the raster, and centroid_lat/lon says the same thing
 #: in physical units.
 BBOX_COLUMNS = ("y0", "y1", "x0", "x1")
 
@@ -227,16 +227,35 @@ class FrontDataset:
     store; ``raw`` keeps the unscaled values for plotting in physical units.
     """
 
-    def __init__(self, X, ids, feature_names, raw, centre, scale,
-                 scaling, dropped, source_info=None):
+    def __init__(self, X, ids, feature_names, raw, center, scale,
+                 scaling, dropped, source_info=None, row_index=None):
         self.X = X
         self.ids = ids
         self.feature_names = feature_names
         self.raw = raw
-        self.centre, self.scale = centre, scale
+        self.center, self.scale = center, scale
         self.scaling = scaling
         self.dropped = dropped
         self.source_info = source_info or {}
+        #: Positions in the RawFronts table these rows came from.  A row drop
+        #: makes X shorter than the table, so anything not selected as a
+        #: feature needs this to line up with X again.
+        self.row_index = (np.arange(len(X)) if row_index is None
+                          else np.asarray(row_index))
+
+    def meta(self, table, columns):
+        """*columns* of the source table, on X's rows and in X's order.
+
+        Features are in ``raw``; this is for everything else -- position,
+        snapshot, anything to color or group a plot by that was never
+        selected as a feature.
+        """
+        columns = [columns] if isinstance(columns, str) else list(columns)
+        missing = [c for c in columns if c not in table.columns]
+        if missing:
+            raise KeyError(f"{missing} not in the table; it has "
+                           f"{len(table.columns)} columns")
+        return table.iloc[self.row_index][columns].reset_index(drop=True)
 
     @classmethod
     def build(cls, table, columns, scaling="standardize", log_channels=True,
@@ -296,8 +315,8 @@ class FrontDataset:
             if unscaled_signed:
                 roots = sorted({c.removeprefix("cross_").rpartition("_")[0]
                                 for c in unscaled_signed})
-                swap = ", ".join(f"{r} -> {NORMALISED_EQUIVALENT[r]}"
-                                 for r in roots if r in NORMALISED_EQUIVALENT)
+                swap = ", ".join(f"{r} -> {NORMALIZED_EQUIVALENT[r]}"
+                                 for r in roots if r in NORMALIZED_EQUIVALENT)
                 warnings.warn(
                     f"div_by_f left {len(unscaled_signed)} column(s) in raw "
                     f"units: {unscaled_signed}.  These need a SIGNED f, which "
@@ -329,7 +348,7 @@ class FrontDataset:
             for col in nan_by_column[nan_by_column > 0].index:
                 missing = values[col].isna()
                 # The mean is taken over the values the column does have, so a
-                # filled row lands on the column's centre once scaled.
+                # filled row lands on the column's center once scaled.
                 value = (values[col].mean() if fill_value == "mean"
                          else float(fill_value))
                 dropped["filled"][col] = {"n": int(missing.sum()),
@@ -360,22 +379,23 @@ class FrontDataset:
 
         raw = values.to_numpy()
         if scaling == "standardize":
-            centre = raw.mean(axis=0)
+            center = raw.mean(axis=0)
             spread = raw.std(axis=0)
         elif scaling == "normalize":
-            centre = raw.min(axis=0)
-            spread = raw.max(axis=0) - centre
+            center = raw.min(axis=0)
+            spread = raw.max(axis=0) - center
         else:
-            centre = np.zeros(raw.shape[1])
+            center = np.zeros(raw.shape[1])
             spread = np.ones(raw.shape[1])
         # A constant column has no spread to divide by and carries no signal;
-        # leaving it at its centred value keeps it finite rather than NaN.
+        # leaving it at its centerd value keeps it finite rather than NaN.
         spread = np.where(spread > 0, spread, 1.0)
-        X = ((raw - centre) / spread).astype("float32")
+        X = ((raw - center) / spread).astype("float32")
 
         ids = table.loc[keep, [c for c in ID_COLUMNS if c in table.columns]]
         return cls(X, ids.reset_index(drop=True), list(columns), raw,
-                   centre, spread, scaling, dropped, source_info)
+                   center, spread, scaling, dropped, source_info,
+                   row_index=np.flatnonzero(keep.to_numpy()))
 
     @classmethod
     def from_source(cls, source, features, dates=None, cross=True, **kwargs):

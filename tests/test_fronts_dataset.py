@@ -156,7 +156,7 @@ def test_each_row_stays_with_its_own_front(raw):
     assert (tag == ds.ids["label"].to_numpy()).all()
 
 
-def test_standardize_centres_each_column(raw):
+def test_standardize_centers_each_column(raw):
     ds = raw.select(["gradb2_mean", "length_km"], scaling="standardize")
     assert ds.X.mean(axis=0) == pytest.approx(0, abs=1e-5)
     assert ds.X.std(axis=0) == pytest.approx(1, abs=1e-5)
@@ -236,7 +236,7 @@ def test_fill_marks_which_values_were_filled(raw):
     assert flag.sum() == ds.dropped["filled"]["mean_curvature"]["n"]
 
 
-def test_mean_fill_lands_on_the_columns_centre(raw):
+def test_mean_fill_lands_on_the_columns_center(raw):
     """The default: a filled front sits at z=0 rather than at an extreme."""
     ds = raw.select(["mean_curvature"], nan_policy="fill",
                     fill_value="mean", missing_indicator=False)

@@ -14,7 +14,9 @@ import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 
-#: Metrics whose natural reading is "fewer is better", so their colour scales
+from visualization.embedding_plots import _is_categorical, _limits
+
+#: Metrics whose natural reading is "fewer is better", so their color scales
 #: are reversed and the best cell is still the brightest.
 _LOWER_IS_BETTER = ("normalized_stress", "noise_%", "top_cluster_%")
 
@@ -112,16 +114,17 @@ def plot_all_metric_heatmaps(result, x, y, *, metrics=None, cmap="viridis",
 
 
 def plot_embedding_grid(result, x, y, *, dims=3, panel_size=3.5,
-                        point_size=2, alpha=0.5, colour_by=None,
+                        point_size=2, alpha=0.5, color_by=None,
                         annot=True, annot_metrics=3):
     """The swept embeddings on the same axes as the heatmaps.
 
-    One scatter per (x, y) cell instead of one colour.  Where a third parameter
+    One scatter per (x, y) cell instead of one color.  Where a third parameter
     also varies, several configurations share a cell -- the heatmaps average
     them; here the first is drawn.
 
-    Points are coloured by cluster label where the sweep clustered, else by
-    *colour_by* (an array parallel to the embedding), else plain.
+    *color_by* is an array parallel to a stored embedding -- index it with
+    ``result.row_index`` first, since the sweep stores a subsample.  It wins
+    when given; cluster labels color the points otherwise.
     """
     df = _frame(result)
     _check_axes(df, x, y)
@@ -151,10 +154,18 @@ def plot_embedding_grid(result, x, y, *, dims=3, panel_size=3.5,
                 ax.axis("off")
                 continue
             E = np.asarray(embeddings[index])
-            colour = labels[index] if labels[index] is not None else colour_by
+            color = color_by if color_by is not None else labels[index]
+            style = {}
+            if color is not None:
+                color = np.asarray(color).ravel()
+                if _is_categorical(color):
+                    style = {"c": color, "cmap": "tab20"}
+                else:
+                    lo, hi = _limits(color)
+                    style = {"c": color, "cmap": "viridis",
+                             "vmin": lo, "vmax": hi}
             ax.scatter(*[E[:, d] for d in range(min(dims, E.shape[1]))],
-                       c=colour, s=point_size, alpha=alpha, cmap="tab20",
-                       linewidths=0)
+                       s=point_size, alpha=alpha, linewidths=0, **style)
             title = f"{x}={xv}  {y}={yv}"
             if annot and metrics:
                 title += "\n" + "  ".join(

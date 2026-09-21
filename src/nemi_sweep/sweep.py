@@ -108,6 +108,10 @@ class SweepResult:
     #: Embeddings actually fitted.  Fewer than len(table) whenever a clustering
     #: grid reuses each one, which is the point of fitting them once.
     n_fitted: int = 0
+    #: Positions in the X handed to run_sweep, for the rows every stored
+    #: embedding kept.  fit_size and keep_size both subsample, so coloring a
+    #: plot by anything outside X has to index it with this first.
+    row_index: np.ndarray = None
 
     def __len__(self):
         return len(self.table)
@@ -164,7 +168,7 @@ def run_sweep(X, embedding_grid, clustering_grid=None, *, n_components=3,
         Subsample this many rows before fitting, so a grid stays affordable on
         a large dataset.  None fits all of X.
     metric_sample : int
-        Rows used for the projection metrics, which are O(n^2) in neighbours.
+        Rows used for the projection metrics, which are O(n^2) in neighbors.
     silhouette : bool
         Also score each clustering.  Needs labels, so it does nothing without a
         clustering grid.
@@ -179,7 +183,7 @@ def run_sweep(X, embedding_grid, clustering_grid=None, *, n_components=3,
                if fit_size and fit_size < len(X) else np.arange(len(X)))
     Xfit = X[fit_idx]
 
-    # The projection metrics compare neighbourhoods in both spaces, so they run
+    # The projection metrics compare neighborhoods in both spaces, so they run
     # on a sample rather than the whole fit.
     m_idx = rng.choice(len(Xfit), size=min(metric_sample, len(Xfit)),
                        replace=False)
@@ -248,4 +252,5 @@ def run_sweep(X, embedding_grid, clustering_grid=None, *, n_components=3,
 
     return SweepResult(pd.DataFrame(rows), embeddings, all_labels,
                        tuple(embedding_grid or ()),
-                       tuple(clustering_grid or ()), failures, n_fitted)
+                       tuple(clustering_grid or ()), failures, n_fitted,
+                       fit_idx[keep])

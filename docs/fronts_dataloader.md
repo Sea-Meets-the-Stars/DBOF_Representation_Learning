@@ -63,7 +63,7 @@ cross-front radius. `print_available_features()` reports what this store has.
 - **`label`, `name`, `time`, `date`** identify a front. They are carried on
   `ds.ids`, parallel to `ds.X`, so a cluster can be joined back to the store.
 - **`y0`, `y1`, `x0`, `x1`** are the bounding box on the model grid, an
-  artefact of the raster; `centroid_lat` / `centroid_lon` says where the front
+  artifact of the raster; `centroid_lat` / `centroid_lon` says where the front
   is in physical units.
 - **`npix_prop`** is the properties table's copy of `npix`, identical to
   geometry's.
@@ -85,7 +85,7 @@ and an unscaled distance metric would see only the former.
 decades on real data. Non-positive values become NaN rather than `-inf`, so the
 NaN policy sees them instead of one bad pixel ruining a column.
 
-A constant column keeps its centred value rather than dividing by zero.
+A constant column keeps its centerd value rather than dividing by zero.
 
 ---
 
@@ -132,7 +132,7 @@ cyclonic is positive in both hemispheres. Select that instead.
 ### How exact the rest is
 
 The same approximation applies to the `DIV_ABS` fields, which have no stored
-normalised counterpart. Measured against `rossby_number` on the SMALL_DATASET
+normalized counterpart. Measured against `rossby_number` on the SMALL_DATASET
 snapshot, for the 96.3% of fronts outside the equator floor:
 
 | | `mean` | `std` |
@@ -244,7 +244,7 @@ straightness about fronts nobody measured.
 | `ids` | `date`, `label`, `name`, `time` for the same rows in the same order |
 | `feature_names` | column names of `X` |
 | `raw` | the same matrix before scaling, in physical units |
-| `centre`, `scale` | what was subtracted and divided, per column |
+| `center`, `scale` | what was subtracted and divided, per column |
 | `dropped` | `{"rows": n, "columns": [...]}` |
 
 `ds.to_frame()` puts the scaled features beside their ids for inspection.
