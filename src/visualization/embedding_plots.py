@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 
+from visualization.colors import NOISE, NOISE_COLOR, distinct_cmap
+
 #: At or below this many distinct whole numbers a variable is drawn as classes
 #: with a legend rather than a gradient with a colorbar.
 CATEGORICAL_MAX = 12
@@ -21,10 +23,6 @@ CATEGORICAL_MAX = 12
 #: Percentiles the color scale clips to.  Front statistics are heavy-tailed
 #: enough that a raw min/max leaves every point at one end of the scale.
 CLIP = (2, 98)
-
-#: The unclustered label, drawn grey and behind the clusters.
-NOISE = -1
-
 
 def _is_categorical(values) -> bool:
     """Few distinct whole numbers -> classes; anything else -> a gradient."""
@@ -61,25 +59,29 @@ def _check_length(embedding, values):
 
 def _classes(ax, coords, values, point_size, alpha):
     """One scatter per class, noise first so clusters draw over it."""
-    palette = plt.get_cmap("tab20")
+    classes = np.unique(values)
+    palette = distinct_cmap(len(classes))
     scatter = None
-    for i, value in enumerate(np.unique(values)):
+    for i, value in enumerate(classes):
         mask = values == value
         scatter = ax.scatter(
             *[c[mask] for c in coords], s=point_size, alpha=alpha,
-            color="0.8" if value == NOISE else palette(i % 20),
+            color=NOISE_COLOR if value == NOISE else palette(i),
             label="noise" if value == NOISE else f"{int(value)}",
             linewidths=0, zorder=1 if value == NOISE else 2)
     ax.legend(markerscale=6, fontsize=7, framealpha=0.8, loc="best")
     return scatter
 
 
-def _draw(ax, embedding, values, dims, point_size, alpha, cmap, rng):
+def _draw(ax, embedding, values, dims, point_size, alpha, cmap, rng,
+          categorical=None):
     """Scatter in shuffled order, so no one snapshot paints over another."""
     order = rng.permutation(len(embedding))
     coords = [embedding[order, d] for d in range(dims)]
     values = values[order]
-    if _is_categorical(values):
+    if categorical is None:
+        categorical = _is_categorical(values)
+    if categorical:
         return _classes(ax, coords, values, point_size, alpha), True
     lo, hi = _limits(values)
     scatter = ax.scatter(*coords, c=values, s=point_size, alpha=alpha,
@@ -98,7 +100,8 @@ def _axes(fig, subplot, dims):
 
 
 def plot_embedding_by(embedding, values, *, name="value", dims=2, ax=None,
-                      point_size=2, alpha=0.5, cmap="viridis", seed=0):
+                      point_size=2, alpha=0.5, cmap="viridis", seed=0,
+                      categorical=None):
     """One embedding, colored by one variable.
 
     *values* is parallel to *embedding*'s rows and in the variable's own units;
@@ -113,7 +116,8 @@ def plot_embedding_by(embedding, values, *, name="value", dims=2, ax=None,
     if ax is None:
         ax = _axes(fig, (1, 1, 1), dims)
     scatter, categorical = _draw(ax, embedding, values, dims, point_size,
-                                 alpha, cmap, np.random.default_rng(seed))
+                                 alpha, cmap, np.random.default_rng(seed),
+                                 categorical)
     ax.set_title(name, fontsize=10)
     if not categorical:
         fig.colorbar(scatter, ax=ax, shrink=0.8, label=name)

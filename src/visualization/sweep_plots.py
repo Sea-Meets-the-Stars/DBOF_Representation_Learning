@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 
+from visualization.colors import cluster_cmap_norm
 from visualization.embedding_plots import _is_categorical, _limits
 
 #: Metrics whose natural reading is "fewer is better", so their color scales
@@ -158,8 +159,11 @@ def plot_embedding_grid(result, x, y, *, dims=3, panel_size=3.5,
             style = {}
             if color is not None:
                 color = np.asarray(color).ravel()
-                if _is_categorical(color):
-                    style = {"c": color, "cmap": "tab20"}
+                # Cluster labels are discrete by definition; only a
+                # supplied color_by has to be guessed at.
+                if color_by is None or _is_categorical(color):
+                    cmap, norm = cluster_cmap_norm(color)
+                    style = {"c": color, "cmap": cmap, "norm": norm}
                 else:
                     lo, hi = _limits(color)
                     style = {"c": color, "cmap": "viridis",

@@ -112,33 +112,9 @@ def vis_dim_redux_list(embeddings, labels=None, categorical=True, titles=None, l
 _DEFAULT_META_FIELDS = ("time_snapshot", "center_lat", "center_lon", "log_grad_b_2_center")
 
 
-def distinct_cmap(n):
-    """Qualitative colormap with n visually distinct colors (any n)."""
-    colors = [colorsys.hsv_to_rgb((i * 0.61803398875) % 1.0,
-                                  0.55 + 0.35 * (i % 2),
-                                  0.75 + 0.20 * ((i // 2) % 2)) for i in range(n)]
-    return ListedColormap(colors)
-
-
-_NOISE_COLOR = (0.6, 0.6, 0.6, 1.0)   # grey slot for -1 / NaN noise
-
-
-def _cluster_cmap_norm(labels, cmap=None):
-    """Discrete cmap + BoundaryNorm for integer cluster labels, with a grey slot
-    for -1 (and NaN) noise.  Cluster k keeps its distinct_cmap(k) color, so colors
-    match across the patch grid, embedding, and map views."""
-    labels = np.asarray(labels, dtype=float)
-    finite = labels[np.isfinite(labels)]
-    hi = int(finite.max()) if finite.size else 0
-    lo = int(finite.min()) if finite.size else 0
-    base = cmap or distinct_cmap(hi + 1)
-    colors = [base(k) for k in range(hi + 1)]
-    bounds = np.arange(lo if lo < 0 else 0, hi + 2) - 0.5
-    if lo < 0:
-        colors = [_NOISE_COLOR] + colors      # -1 -> grey
-    out = ListedColormap(colors)
-    out.set_bad(_NOISE_COLOR)                  # NaN (member noise) -> grey too
-    return out, BoundaryNorm(bounds, len(colors))
+from visualization.colors import (NOISE_COLOR as _NOISE_COLOR,
+                                  cluster_cmap_norm as _cluster_cmap_norm,
+                                  distinct_cmap)
 
 
 def _as_int_labels(labels):
