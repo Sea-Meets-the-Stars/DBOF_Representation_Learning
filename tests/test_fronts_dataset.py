@@ -4,8 +4,8 @@ import pandas as pd
 import pytest
 
 from fronts_dataloader.fronts_dataset import (
-    BBOX_COLUMNS, DUPLICATE_COLUMNS, FrontDataset, FrontDataSource,
-    ID_COLUMNS, RawFronts)
+    ALWAYS_LOADED, BBOX_COLUMNS, DUPLICATE_COLUMNS, FrontDataset,
+    FrontDataSource, ID_COLUMNS, RawFronts)
 
 from synthetic_fronts import DATE, DATE2, build_store
 
@@ -48,6 +48,49 @@ def test_groups_cover_geometry_properties_and_cross(source):
 def test_cross_is_absent_when_the_store_has_none(tmp_path):
     build_store(tmp_path / "s.zarr", n=10, cross=False)
     assert "cross" not in FrontDataSource(str(tmp_path / "s.zarr")).feature_groups()
+
+
+# ---------------------------------------------------------------------------
+#  Reading less than the whole store
+# ---------------------------------------------------------------------------
+
+def test_narrowing_the_read_does_not_change_what_comes_back(source):
+    """features= is meant to save requests, not to answer differently."""
+    whole = RawFronts.load(source)
+    part = RawFronts.load(source, features=["geometry", "gradb2"])
+    shared = [c for c in part.table.columns if c in whole.table.columns]
+    pd.testing.assert_frame_equal(part.table[shared], whole.table[shared])
+    assert len(part.table.columns) < len(whole.table.columns)
+
+
+def test_a_narrowed_read_keeps_what_selection_needs(source):
+    """Dropping these would break div_by_f and traceability, not a feature."""
+    part = RawFronts.load(source, features=["gradb2_mean"])
+    assert not set(ALWAYS_LOADED) - set(part.table.columns)
+
+
+def test_a_narrowed_read_leaves_the_other_channels_behind(source):
+    part = RawFronts.load(source, features=["gradb2"])
+    assert "gradb2_mean" in part.table.columns
+    assert "turner_angle_mean" not in part.table.columns
+
+
+def test_stats_narrows_the_read_as_well_as_the_selection(source):
+    part = RawFronts.load(source, features=["gradb2"], stats=("mean",))
+    assert "gradb2_mean" in part.table.columns
+    assert "gradb2_std" not in part.table.columns
+
+
+def test_a_narrowed_read_still_groups_only_what_it_has(source):
+    part = RawFronts.load(source, features=["gradb2"])
+    for columns in part.groups.values():
+        assert not set(columns) - set(part.table.columns)
+
+
+def test_worker_count_does_not_reorder_the_snapshots(source):
+    serial = RawFronts.load(source, workers=1)
+    threaded = RawFronts.load(source, workers=8)
+    pd.testing.assert_frame_equal(serial.table, threaded.table)
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -66,6 +67,16 @@ GEOMETRY = "geometry"
 PROPERTIES = "properties"
 CROSS = "cross"
 
+#: The cross-front table's name in the store.  CROSS is the group name the
+#: prefixed columns are offered under, which is not the same string.
+CROSS_TABLE = "cross_properties"
+
+#: Columns load() reads whatever *features* asks for.  Leaving them out would
+#: break selection rather than just drop a feature: div_by_f divides by the
+#: Coriolis parameter at centroid_lat, and a cluster cannot be traced back to a
+#: front without the identifiers.
+ALWAYS_LOADED = (*ID_COLUMNS, "centroid_lat", "centroid_lon")
+
 
 def _split_stat(column):
     """``('gradb2', 'mean')`` for a property column, ``(column, None)`` else."""
@@ -80,6 +91,39 @@ def _keep_stats(columns, stats):
     stats = set(stats)
     return [c for c in columns
             if (stat := _split_stat(c)[1]) is None or stat in stats]
+
+
+def _resolve(items, groups, columns, stats=None):
+    """Expand *items* to concrete column names, in the order given.
+
+    *groups* maps a group name to its columns, *columns* is every name that can
+    be asked for.  Shared by RawFronts.resolve, which matches against a loaded
+    table, and RawFronts.load, which matches against the store's metadata
+    before anything has been read.
+    """
+    out = []
+    for item in items:
+        if item in groups:
+            out.extend(_keep_stats(groups[item], stats))
+        elif item in columns:
+            out.append(item)
+        else:
+            matched = [c for c in columns
+                       if c.startswith(f"{item}_") and c not in ID_COLUMNS]
+            if not matched:
+                raise KeyError(
+                    f"{item!r} is not a group, channel or column.  Groups: "
+                    f"{sorted(groups)}.  Try "
+                    f"FrontDataSource.print_available_features()."
+                )
+            kept = _keep_stats(matched, stats)
+            if not kept:
+                raise KeyError(
+                    f"{item!r} has no {sorted(stats)} statistic; it offers "
+                    f"{sorted(_split_stat(c)[1] for c in matched)}."
+                )
+            out.extend(kept)
+    return list(dict.fromkeys(out))
 
 
 def _coriolis(table, equator_deg):
@@ -239,25 +283,57 @@ def _ihs_transform(a):
 class FrontDataSource:
     """A front store, and what it offers as features."""
 
-    def __init__(self, url, storage_options=None):
+    def __init__(self, url, storage_options=None, max_connections=32):
+        """Open a store.
+
+        *max_connections* is the size of the HTTP connection pool, and so the
+        ceiling on how many of load()'s workers can have a request in flight at
+        once; botocore's own default is 10.  S3 urls only -- a local store has
+        no pool, and zarr rejects storage options it cannot use.  An explicit
+        ``config_kwargs["max_pool_connections"]`` wins over it.
+        """
         self.url = url
+        if str(url).startswith("s3://"):
+            storage_options = dict(storage_options or {})
+            config = dict(storage_options.get("config_kwargs") or {})
+            config.setdefault("max_pool_connections", max_connections)
+            storage_options["config_kwargs"] = config
         self.store = FrontStore.open(url, storage_options=storage_options)
 
     @property
     def dates(self):
         return self.store.dates
 
+    def table_columns(self, date=None):
+        """``{table: [column, ...]}`` as the store holds them.
+
+        Read from each table's ``columns`` attribute, the same order
+        FrontStore._table reads back, so this costs one metadata request rather
+        than a read of every array in the table.
+        """
+        date = date or self.store.dates[0]
+        group = self.store.root[date]
+        names = [GEOMETRY, PROPERTIES]
+        if self.store.has_cross_properties(date):
+            names.append(CROSS_TABLE)
+        out = {}
+        for name in names:
+            table = group[name]
+            out[name] = list(dict(table.attrs).get("columns")
+                             or sorted(table.array_keys()))
+        return out
+
     def feature_groups(self, date=None):
         """``{group: [column, ...]}`` for the columns usable as features."""
-        date = date or self.store.dates[0]
-        geom = [c for c in self.store.geometry(date).columns
-                if c not in ID_COLUMNS and c not in BBOX_COLUMNS]
-        props = [c for c in self.store.properties(date).columns
-                 if c not in DUPLICATE_COLUMNS]
-        groups = {GEOMETRY: geom, PROPERTIES: props}
-        if self.store.has_cross_properties(date):
-            groups[CROSS] = [f"cross_{c}" for c in
-                             self.store.cross_properties(date).columns
+        columns = self.table_columns(date)
+        groups = {
+            GEOMETRY: [c for c in columns[GEOMETRY]
+                       if c not in ID_COLUMNS and c not in BBOX_COLUMNS],
+            PROPERTIES: [c for c in columns[PROPERTIES]
+                         if c not in DUPLICATE_COLUMNS],
+        }
+        if CROSS_TABLE in columns:
+            groups[CROSS] = [f"cross_{c}" for c in columns[CROSS_TABLE]
                              if c not in DUPLICATE_COLUMNS]
         return groups
 
@@ -276,25 +352,53 @@ class RawFronts:
         self.source_info = source_info or {}
 
     @classmethod
-    def load(cls, source, dates=None, cross=True):
+    def load(cls, source, dates=None, features=None, stats=None, cross=True,
+             workers=16):
         """Read the store into one table.
 
+        *features* and *stats* narrow what is read, in the same vocabulary
+        select() takes -- a group, a channel, or one column.  The default reads
+        every column, which is what leaves room to explore; naming features
+        here is how a run stops paying for the columns it will not use.  The
+        columns in ALWAYS_LOADED come back either way.  What is loaded is still
+        only an upper bound on what select() is then given.
+
         *cross* joins the cross-front statistics under a ``cross_`` prefix; it
-        is silently skipped for snapshots that have none.
+        is silently skipped for snapshots that have none.  It is all or
+        nothing: FrontStore.fronts takes no cross column list, so *features*
+        does not narrow it.
+
+        Snapshots are read on *workers* threads.  Each column of each table is
+        a separate object in the store, so a read is mostly waiting on request
+        latency; the store's connection pool caps how many of those waits
+        actually overlap (see FrontDataSource).
         """
         store = source.store
         dates = list(dates) if dates is not None else store.dates
-        frames = []
-        for date in dates:
-            frame = store.fronts(date, cross=cross)
-            frame.insert(0, "date", date)
-            frames.append(frame)
-        table = pd.concat(frames, ignore_index=True)
         # Group membership comes from the store's own tables rather than being
         # guessed from column names, which collide (cross_gradb2_mean vs
         # gradb2_mean) and would silently mis-file a new geometry column.
+        feature_groups = source.feature_groups(dates[0])
+        geometry_columns = property_columns = None
+        if features is not None:
+            offered = [c for cols in feature_groups.values() for c in cols]
+            wanted = set(_resolve(features, feature_groups, offered, stats))
+            wanted.update(ALWAYS_LOADED)
+            stored = source.table_columns(dates[0])
+            geometry_columns = [c for c in stored[GEOMETRY] if c in wanted]
+            property_columns = [c for c in stored[PROPERTIES] if c in wanted]
+
+        def read(date):
+            frame = store.fronts(date, geometry_columns=geometry_columns,
+                                 property_columns=property_columns, cross=cross)
+            frame.insert(0, "date", date)
+            return frame
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            frames = list(pool.map(read, dates))
+        table = pd.concat(frames, ignore_index=True)
         groups = {g: [c for c in cols if c in table.columns]
-                  for g, cols in source.feature_groups(dates[0]).items()}
+                  for g, cols in feature_groups.items()}
         return cls(table, groups, {"url": source.url, "dates": dates,
                                    "n_fronts": len(table)})
 
@@ -313,29 +417,7 @@ class RawFronts:
         outright, since naming it is already the choice, nor a geometry column,
         which is not a statistic of anything.
         """
-        out = []
-        for item in features:
-            if item in self.groups:
-                out.extend(_keep_stats(self.groups[item], stats))
-            elif item in self.table.columns:
-                out.append(item)
-            else:
-                matched = [c for c in self.table.columns
-                           if c.startswith(f"{item}_") and c not in ID_COLUMNS]
-                if not matched:
-                    raise KeyError(
-                        f"{item!r} is not a group, channel or column.  Groups: "
-                        f"{sorted(self.groups)}.  Try "
-                        f"FrontDataSource.print_available_features()."
-                    )
-                kept = _keep_stats(matched, stats)
-                if not kept:
-                    raise KeyError(
-                        f"{item!r} has no {sorted(stats)} statistic; it offers "
-                        f"{sorted(_split_stat(c)[1] for c in matched)}."
-                    )
-                out.extend(kept)
-        return list(dict.fromkeys(out))
+        return _resolve(features, self.groups, self.table.columns, stats)
 
     def select(self, features, stats=None, scaling="standardize",
                log_channels=True, ihs_channels=True, div_by_f=False,
@@ -562,10 +644,16 @@ class FrontDataset:
                    transforms=transforms)
 
     @classmethod
-    def from_source(cls, source, features, dates=None, cross=True, **kwargs):
-        """Load and select in one step."""
-        return RawFronts.load(source, dates=dates, cross=cross).select(
-            features, **kwargs)
+    def from_source(cls, source, features, dates=None, stats=None, cross=True,
+                    workers=16, **kwargs):
+        """Load and select in one step.
+
+        Nothing is explored between the two, so *features* narrows the read as
+        well as the selection.
+        """
+        raw = RawFronts.load(source, dates=dates, features=features,
+                             stats=stats, cross=cross, workers=workers)
+        return raw.select(features, stats=stats, **kwargs)
 
     def __len__(self):
         return len(self.X)
