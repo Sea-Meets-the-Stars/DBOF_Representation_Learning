@@ -85,7 +85,9 @@ def test_row_index_tracks_dropped_rows(raw):
 
 
 def test_meta_lines_up_with_the_matrix(raw):
-    dropped = raw.select(["geometry"], nan_policy="drop_rows")
+    """ihs_channels=False keeps raw physical, so meta can be compared to it."""
+    dropped = raw.select(["geometry"], nan_policy="drop_rows",
+                         ihs_channels=False)
     meta = dropped.meta(raw.table, ["length_km"])
     column = dropped.feature_names.index("length_km")
     assert np.allclose(meta["length_km"], dropped.raw[:, column])

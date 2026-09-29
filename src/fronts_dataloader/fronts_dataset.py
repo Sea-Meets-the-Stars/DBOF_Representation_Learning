@@ -16,6 +16,7 @@ import warnings
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize_scalar
 
 from front_finding.store import FrontStore
 
@@ -36,6 +37,16 @@ DUPLICATE_COLUMNS = ("flabel", "npix_prop")
 
 #: Channels whose values span decades, so a log is applied before scaling.
 LOG_PREFIX = "grad"
+
+IHS_PREFIX = ["oce", "rossby", "strain", "mean_curv", "length",
+              "okubo_weiss", "divergence", "relative_vorticity", "wind_stress_curl",
+              "W", "Eta", "U", "V", "ekman_pumping", "u_ekman", "v_ekman"]
+
+#: Statistics of a logged channel that stay linear.  A squared gradient's
+#: magnitude statistics are strictly positive, but skew is dimensionless and
+#: signed -- log10 sends its negative half to NaN, and the nan_policy then
+#: drops those fronts.
+UNLOGGED_STATS = ("skew",)
 
 #: A property column is "{channel}_{stat}".  Recognising the statistic is what
 #: lets a channel expand to a subset of them; a column that matches nothing
@@ -102,6 +113,127 @@ def _safe_log10(a):
     out = np.full(a.shape, np.nan, dtype="float64")
     np.log10(a, out=out, where=a > 0)
     return out
+
+def _ihs_neg_loglik(log_theta, v):
+    """Negated concentrated log-likelihood of the IHS parameter, up to a constant.
+
+    The model is Johnson's (1949) S_U with zero location: the column is taken
+    to satisfy
+
+        gamma + delta * asinh(v / lambda)  ~  N(0, 1)
+
+    so a raw column is S_U-distributed and its asinh transform is normal --
+    two ways of writing one statement, since S_U is *defined* by that
+    translation.  Only lambda needs searching for; gamma and delta are the
+    mean and spread of the transformed values and have closed forms, which is
+    what the standardization after the transform already computes.
+
+    Written here as equation (10) of Burbidge, Magee & Robb (1988), with
+    theta = 1/lambda:
+
+        l(theta) = (constant) - (n/2) log g(theta)' M g(theta)
+                              - (1/2) sum log(1 + theta^2 v_t^2)
+
+    where g(theta)_t = asinh(theta * v_t) / theta.  Term by term:
+
+    * ``g(theta)``           -> ``np.arcsinh(th * v) / th``
+    * ``(n/2) log g' M g``   -> ``0.5 * n * log(sum((z - z.mean())**2))``
+    * ``(1/2) sum log(...)`` -> ``0.5 * sum(log1p((th * v)**2))``
+
+    M is their equation (5), ``I - X(X'X)^-1 X'``, the residual maker for the
+    regression ``g(theta) = X.gamma + eps``.  A feature has no regressors, so
+    X is the intercept alone, M subtracts the mean, and ``g' M g`` becomes
+    ``sum((z - z.mean())**2)``.  That specialization is not one the paper
+    considers -- its example carries 91 regressors -- but it recovers the
+    Johnson S_U profile likelihood exactly, up to a constant in lambda.
+
+    The second term is the Jacobian of the change of variables.  Without it
+    the first term alone is maximized by squashing every value onto a point
+    and theta runs away; the Jacobian prices that compression.
+
+    The (constant) is dropped, since it does not move the argmax, and the
+    whole is negated for a minimizer.  Parameterized in log(theta), which
+    keeps the search scale-free and enforces the paper's restriction to
+    theta >= 0 (their Sec. 2.2: g is symmetric about 0 in theta).
+    """
+    th = np.exp(log_theta)
+    z = np.arcsinh(th * v) / th
+    return (0.5 * v.size * np.log(np.sum((z - z.mean()) ** 2))
+            + 0.5 * np.sum(np.log1p((th * v) ** 2)))
+
+
+def _fit_ihs(v, decades=6, bounds=None, sample=50_000, seed=0):
+    """Fit the asinh crossover by maximum likelihood.
+
+    Estimates lambda in the Johnson S_U model of :func:`_ihs_neg_loglik` and
+    reports ``c`` = lambda = 1/theta, in the column's own units, alongside a
+    ``regime`` word.
+
+    The regime is which Johnson family the column turned out to want.  S_U
+    degenerates at the edges of its parameter space, and both edges are
+    separate members of Johnson's system rather than failures:
+
+        MLE           interior optimum      -- S_U, genuinely sinh-bent
+        MLE->identity theta at lower bound  -- S_N, already normal
+        MLE->log      theta at upper bound  -- S_L, lognormal
+
+    At either edge the maximum likelihood estimate does not exist: the
+    likelihood climbs monotonically toward a supremum it never attains, since
+    the limiting transform is outside the family.  Bounds make the parameter
+    space compact so a maximum is attained, and the regime then reports that
+    it was attained at the boundary.  Without them an unbounded search stops
+    wherever its tolerance runs out on a flat likelihood and returns a number
+    that reads like an estimate.  Read the regime before the value.
+
+    *bounds* on theta default to *decades* either side of 1/MAD.  They have
+    to track the column's own scale: these channels run from 1e-10 to 1e2, so
+    a fixed interval clips the small ones and leaves the large ones so much
+    room that a log-regime column reports a spurious interior optimum.
+
+    The S_U assumption selects the transform; it is not asserted as a
+    description of the column.  A mixture cannot be made normal by any
+    lambda, so the fit returns its best S_U-shaped answer to a non-S_U
+    question and says nothing about having failed.  gradtheta2 is the case
+    here: its two modes are the sea-ice population, whose surface sits at the
+    freezing point with temperature slaved to salinity.
+
+    References
+    ----------
+    Johnson, N. L. (1949), "Systems of Frequency Curves Generated by Methods
+    of Translation", Biometrika 36(1-2), 149-176 -- the S_U family.
+    Burbidge, J. B., Magee, L., Robb, A. L. (1988), "Alternative
+    Transformations to Handle Extreme Values of the Dependent Variable",
+    J. Amer. Statist. Assoc. 83(401), 123-127 -- equation (10), and the
+    argument for IHS over Box-Cox when values take both signs.
+    """
+    v = np.asarray(v, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size < 8:
+        raise ValueError("need at least 8 finite values to fit")
+    if sample and v.size > sample:
+        v = v[np.random.default_rng(seed).choice(v.size, sample, replace=False)]
+
+    if bounds is None:
+        mad = np.median(np.abs(v - np.median(v))) or 1.0
+        mid = np.log(1.0 / mad)
+        lo, hi = mid - decades * np.log(10), mid + decades * np.log(10)
+    else:
+        lo, hi = np.log(bounds)
+    r = minimize_scalar(_ihs_neg_loglik, args=(v,), bounds=(lo, hi),
+                        method="bounded")
+    edge = 0.01 * (hi - lo)
+    regime = ("MLE\u2192identity" if r.x < lo + edge
+              else "MLE\u2192log" if r.x > hi - edge else "MLE")
+    return dict(theta=float(np.exp(r.x)), c=float(np.exp(-r.x)), regime=regime)
+
+def _note(transforms, col, text):
+    """Record a transform applied to *col*, in the order applied."""
+    transforms.setdefault(col, []).append(text)
+
+
+def _ihs_transform(a):
+    fit = _fit_ihs(a)
+    return np.arcsinh(a / fit["c"]), fit["regime"], fit["c"]
 
 
 class FrontDataSource:
@@ -206,12 +338,14 @@ class RawFronts:
         return list(dict.fromkeys(out))
 
     def select(self, features, stats=None, scaling="standardize",
-               log_channels=True, div_by_f=False, equator_deg=5.0,
+               log_channels=True, ihs_channels=True, div_by_f=False,
+               equator_deg=5.0,
                nan_policy="error", fill_value="mean", missing_indicator=True):
         """Build the dataset NEMI consumes.  See :class:`FrontDataset`."""
         columns = self.resolve(features, stats)
         return FrontDataset.build(self.table, columns, scaling=scaling,
                                   log_channels=log_channels,
+                                  ihs_channels=ihs_channels,
                                   div_by_f=div_by_f, equator_deg=equator_deg,
                                   nan_policy=nan_policy,
                                   fill_value=fill_value,
@@ -228,7 +362,8 @@ class FrontDataset:
     """
 
     def __init__(self, X, ids, feature_names, raw, center, scale,
-                 scaling, dropped, source_info=None, row_index=None):
+                 scaling, dropped, source_info=None, row_index=None,
+                 transforms=None):
         self.X = X
         self.ids = ids
         self.feature_names = feature_names
@@ -242,6 +377,13 @@ class FrontDataset:
         #: feature needs this to line up with X again.
         self.row_index = (np.arange(len(X)) if row_index is None
                           else np.asarray(row_index))
+        #: {column: [transform, ...]} in the order applied.  ``raw`` holds
+        #: post-transform values, so this is the record of what they are.
+        self.transforms = transforms or {}
+
+    def transform_label(self, col):
+        """One-line description of what *col* went through."""
+        return " -> ".join(self.transforms.get(col, ["none"]))
 
     def meta(self, table, columns):
         """*columns* of the source table, on X's rows and in X's order.
@@ -259,6 +401,7 @@ class FrontDataset:
 
     @classmethod
     def build(cls, table, columns, scaling="standardize", log_channels=True,
+              ihs_channels=True,
               div_by_f=False, equator_deg=5.0,
               nan_policy="error", fill_value="mean", missing_indicator=True,
               source_info=None):
@@ -293,11 +436,11 @@ class FrontDataset:
             raise ValueError("scaling must be 'standardize', 'normalize' or None")
 
         values = table[columns].astype("float64").copy()
-        if log_channels:
-            for col in columns:
-                if col.removeprefix("cross_").startswith(LOG_PREFIX):
-                    values[col] = _safe_log10(values[col].to_numpy())
-
+        #: column -> the transforms it went through, in order.  A column
+        #: absent from this passed through untouched.  Carried on the dataset
+        #: so a plot can say what reached the clusterer, rather than
+        #: re-deriving it and possibly disagreeing.
+        transforms = {}
         scaled_by_f, unscaled_signed = [], []
         if div_by_f:
             f = np.abs(_coriolis(table, equator_deg))
@@ -312,6 +455,7 @@ class FrontDataset:
                 elif root in DIV_ABS and stat in SCALED_STATS:
                     values[col] = values[col] / f
                     scaled_by_f.append(col)
+                    _note(transforms, col, "/|f|")
             if unscaled_signed:
                 roots = sorted({c.removeprefix("cross_").rpartition("_")[0]
                                 for c in unscaled_signed})
@@ -327,6 +471,25 @@ class FrontDataset:
                     f"leak into the embedding.  The store already has the "
                     f"per-pixel quotient: {swap}.",
                     UserWarning, stacklevel=3)
+
+        if log_channels:
+            for col in columns:
+                stat = STAT_SUFFIX.search(col)
+                if (col.removeprefix("cross_").startswith(LOG_PREFIX)
+                        and not (stat and stat.group(1) in UNLOGGED_STATS)):
+                    values[col] = _safe_log10(values[col].to_numpy())
+                    _note(transforms, col, "log10")
+
+        if ihs_channels:
+            for col in columns:
+                stat = STAT_SUFFIX.search(col)
+                for prefix in IHS_PREFIX:
+                    if (col.removeprefix("cross_").startswith(prefix)
+                            and not (stat and stat.group(1) in UNLOGGED_STATS)):
+                        values[col], regime, c = _ihs_transform(
+                            values[col].to_numpy())
+                        _note(transforms, col, f"asinh(x/{c:.3g}) [{regime}]")
+                        break          # one prefix match is enough
 
         dropped = {"rows": 0, "columns": [], "filled": {},
                    "scaled_by_f": scaled_by_f,
@@ -395,7 +558,8 @@ class FrontDataset:
         ids = table.loc[keep, [c for c in ID_COLUMNS if c in table.columns]]
         return cls(X, ids.reset_index(drop=True), list(columns), raw,
                    center, spread, scaling, dropped, source_info,
-                   row_index=np.flatnonzero(keep.to_numpy()))
+                   row_index=np.flatnonzero(keep.to_numpy()),
+                   transforms=transforms)
 
     @classmethod
     def from_source(cls, source, features, dates=None, cross=True, **kwargs):

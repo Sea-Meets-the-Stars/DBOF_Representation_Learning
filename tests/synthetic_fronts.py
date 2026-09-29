@@ -41,6 +41,8 @@ def _properties(n, seed=0, prefix=""):
         "npix": rng.integers(7, 400, n).astype("int64"),
         f"{prefix}gradb2_mean": rng.lognormal(-30, 3, n),   # spans decades
         f"{prefix}gradb2_std": rng.lognormal(-30, 3, n),
+        # Dimensionless and signed, unlike the magnitude statistics beside it.
+        f"{prefix}gradb2_skew": rng.normal(0, 1, n),
         f"{prefix}turner_angle_mean": rng.uniform(-90, 90, n),
         f"{prefix}density_mean": rng.uniform(20, 30, n),
         # Kinematic fields and the divisor, so the div_by_f path is reachable.

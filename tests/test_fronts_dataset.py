@@ -55,7 +55,8 @@ def test_cross_is_absent_when_the_store_has_none(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_a_channel_expands_to_its_statistics(raw):
-    assert raw.resolve(["gradb2"]) == ["gradb2_mean", "gradb2_std"]
+    assert raw.resolve(["gradb2"]) == ["gradb2_mean", "gradb2_std",
+                                       "gradb2_skew"]
 
 
 def test_the_matrix_is_rectangular_under_every_policy(raw):
@@ -83,7 +84,7 @@ def test_one_column_can_be_named_directly(raw):
 
 def test_selection_order_is_kept_and_duplicates_collapse(raw):
     assert raw.resolve(["gradb2_std", "gradb2", "gradb2_std"]) == [
-        "gradb2_std", "gradb2_mean"]
+        "gradb2_std", "gradb2_mean", "gradb2_skew"]
 
 
 def test_a_channel_does_not_pull_in_its_cross_twin(raw):
@@ -132,7 +133,7 @@ def test_an_unknown_feature_names_the_groups(raw):
 def test_the_matrix_is_what_nemi_takes(raw):
     ds = raw.select(["gradb2", "length_km"])
     assert ds.X.ndim == 2
-    assert ds.X.shape == (len(ds.ids), 3)
+    assert ds.X.shape == (len(ds.ids), 4)   # mean, std, skew, length_km
     assert ds.X.dtype == np.float32
     assert np.isfinite(ds.X).all()
 
@@ -237,15 +238,19 @@ def test_fill_marks_which_values_were_filled(raw):
 
 
 def test_mean_fill_lands_on_the_columns_center(raw):
-    """The default: a filled front sits at z=0 rather than at an extreme."""
-    ds = raw.select(["mean_curvature"], nan_policy="fill",
-                    fill_value="mean", missing_indicator=False)
-    observed = raw.table["mean_curvature"].dropna()
-    assert ds.dropped["filled"]["mean_curvature"]["value"] == pytest.approx(
-        observed.mean())
-    filled = ds.X[raw.table["mean_curvature"].isna().to_numpy()]
-    assert filled.mean() == pytest.approx(0, abs=0.05)
+    """The fill is the mean of what reaches the clusterer, not of the store.
 
+    mean_curvature is transformed before the fill runs, and asinh is not
+    linear, so asinh(mean(x)) is not mean(asinh(x)).  Filling at the centre of
+    the transformed column is what puts the front in the middle of the
+    distribution the clusterer sees.
+    """
+    ds = raw.select(["mean_curvature"], nan_policy="fill",
+                    missing_indicator=False)
+    filled = ds.dropped["filled"]["mean_curvature"]
+    assert filled["n"] > 0
+    measured = ds.raw[:, 0][~np.isclose(ds.raw[:, 0], filled["value"])]
+    assert filled["value"] == pytest.approx(measured.mean(), rel=1e-6)
 
 def test_a_bad_fill_value_is_rejected(raw):
     with pytest.raises(ValueError, match="fill_value"):
@@ -381,3 +386,69 @@ def test_snapshots_concatenate_and_stay_labelled(tmp_path):
         FrontDataSource(str(tmp_path / "s.zarr")), ["gradb2_mean"])
     assert len(ds.X) == 24
     assert set(ds.ids["date"]) == {DATE, DATE2}
+
+
+# ---------------------------------------------------------------------------
+#  The log applies to magnitudes, not to shape
+
+def test_gradient_magnitudes_are_logged(raw):
+    ds = raw.select(["gradb2_mean"], scaling=None, nan_policy="error")
+    stored = raw.table["gradb2_mean"].to_numpy()
+    assert np.allclose(ds.raw[:, 0], np.log10(stored))
+
+
+def test_gradient_skew_is_not_logged(raw):
+    """skew is dimensionless and signed; log10 would delete its negative half."""
+    ds = raw.select(["gradb2_skew"], scaling=None, nan_policy="error")
+    stored = raw.table["gradb2_skew"].to_numpy()
+    assert (stored < 0).any(), "fixture must exercise the negative half"
+    assert np.allclose(ds.raw[:, 0], stored)
+
+
+def test_selecting_gradient_skew_costs_no_fronts(raw):
+    """The negative half used to become NaN and be dropped as whole rows."""
+    ds = raw.select(["gradb2_skew"], scaling=None, nan_policy="drop_rows")
+    assert len(ds.X) == len(raw.table)
+    assert ds.dropped["rows"] == 0
+
+
+def test_the_channel_expands_to_both_behaviours(raw):
+    ds = raw.select(["gradb2"], stats=("mean", "skew"), scaling=None,
+                    nan_policy="error")
+    mean_col = ds.feature_names.index("gradb2_mean")
+    skew_col = ds.feature_names.index("gradb2_skew")
+    table = raw.table
+    assert np.allclose(ds.raw[:, mean_col], np.log10(table["gradb2_mean"]))
+    assert np.allclose(ds.raw[:, skew_col], table["gradb2_skew"])
+
+
+# ---------------------------------------------------------------------------
+#  What each column went through
+
+def test_transforms_record_the_chain(raw):
+    ds = raw.select(["gradb2_mean", "relative_vorticity_mean"],
+                    nan_policy="fill", missing_indicator=False)
+    assert ds.transforms["gradb2_mean"] == ["log10"]
+    assert ds.transforms["relative_vorticity_mean"][0].startswith("asinh(x/")
+
+
+def test_a_column_records_every_transform_in_order(raw):
+    """divergence is divided by |f| and then compressed; both are recorded."""
+    ds = raw.select(["divergence_mean"], div_by_f=True, nan_policy="fill",
+                    missing_indicator=False)
+    chain = ds.transforms["divergence_mean"]
+    assert chain[0] == "/|f|"
+    assert chain[1].startswith("asinh(x/")
+
+
+def test_an_untouched_column_has_no_entry(raw):
+    ds = raw.select(["orientation"], ihs_channels=False, nan_policy="fill",
+                    missing_indicator=False)
+    assert "orientation" not in ds.transforms
+    assert ds.transform_label("orientation") == "none"
+
+
+def test_transform_label_joins_the_chain(raw):
+    ds = raw.select(["divergence_mean"], div_by_f=True, nan_policy="fill",
+                    missing_indicator=False)
+    assert " -> " in ds.transform_label("divergence_mean")
