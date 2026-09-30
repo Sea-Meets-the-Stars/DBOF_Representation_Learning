@@ -93,6 +93,51 @@ def _keep_stats(columns, stats):
             if (stat := _split_stat(c)[1]) is None or stat in stats]
 
 
+def _front_wind_angle(table):
+    """Acute angle between each front's axis and the wind, in [0, 90] degrees.
+
+    0 is wind blowing along the front, 90 across it.  ``orientation`` and
+    ``arctan2(east, north)`` are both measured from north on the stitched
+    raster, so they subtract directly; the fold takes the difference to the
+    acute angle, which is as much as a front's unsigned axis can support --
+    down-front and up-front are indistinguishable from orientation alone.
+    """
+    wind = np.degrees(np.arctan2(table["oceTAUX_mean"].to_numpy(),
+                                 table["oceTAUY_mean"].to_numpy()))
+    return np.abs(((wind - table["orientation"].to_numpy() + 90) % 180) - 90)
+
+
+#: Features computed from other columns rather than read from the store, as
+#: ``{name: (builder, columns it is built from)}``.  They are asked for by name
+#: alongside stored features; their inputs need not be selected as well.
+DERIVED_FEATURES = {
+    "front_wind_angle": (_front_wind_angle,
+                         ("orientation", "oceTAUX_mean", "oceTAUY_mean")),
+}
+
+
+def _add_derived(table, columns):
+    """Compute every derived column in *columns* onto *table*, in place.
+
+    The column joins the table rather than a private copy, so anything else
+    holding the table -- a plot of the stored values, meta(), a row filter --
+    finds the same feature the dataset was built from.  Already-present
+    columns are left alone, so repeating a selection costs nothing.
+    """
+    for col in columns:
+        if col not in DERIVED_FEATURES or col in table.columns:
+            continue
+        builder, needs = DERIVED_FEATURES[col]
+        missing = [c for c in needs if c not in table.columns]
+        if missing:
+            raise KeyError(
+                f"{col!r} is computed from {list(needs)}; {missing} missing "
+                f"from the loaded table.  Name them, or the channels they "
+                f"belong to, in RawFronts.load(features=...)."
+            )
+        table[col] = builder(table)
+
+
 def _resolve(items, groups, columns, stats=None):
     """Expand *items* to concrete column names, in the order given.
 
@@ -103,7 +148,9 @@ def _resolve(items, groups, columns, stats=None):
     """
     out = []
     for item in items:
-        if item in groups:
+        if item in DERIVED_FEATURES:
+            out.append(item)
+        elif item in groups:
             out.extend(_keep_stats(groups[item], stats))
         elif item in columns:
             out.append(item)
@@ -384,6 +431,10 @@ class RawFronts:
             offered = [c for cols in feature_groups.values() for c in cols]
             wanted = set(_resolve(features, feature_groups, offered, stats))
             wanted.update(ALWAYS_LOADED)
+            # A derived feature is not a stored column, so read what it is
+            # built from instead; select() would otherwise find them missing.
+            for name in wanted & set(DERIVED_FEATURES):
+                wanted.update(DERIVED_FEATURES[name][1])
             stored = source.table_columns(dates[0])
             geometry_columns = [c for c in stored[GEOMETRY] if c in wanted]
             property_columns = [c for c in stored[PROPERTIES] if c in wanted]
@@ -409,8 +460,10 @@ class RawFronts:
         """Expand *features* to concrete column names, in the order given.
 
         An entry may be a group ('geometry', 'properties', 'cross'), a channel
-        ('gradb2', which takes every gradb2_* statistic), or one column
-        ('gradb2_mean').  Duplicates collapse, keeping first position.
+        ('gradb2', which takes every gradb2_* statistic), one column
+        ('gradb2_mean'), or a derived feature ('front_wind_angle', computed by
+        select() from columns it does not make you name).  Duplicates collapse,
+        keeping first position.
 
         *stats* narrows what a group or channel expands to -- ('mean', 'std',
         'skew') to skip the order statistics.  It does not touch a column named
@@ -423,8 +476,14 @@ class RawFronts:
                log_channels=True, ihs_channels=True, div_by_f=False,
                equator_deg=5.0,
                nan_policy="error", fill_value="mean", missing_indicator=True):
-        """Build the dataset NEMI consumes.  See :class:`FrontDataset`."""
+        """Build the dataset NEMI consumes.  See :class:`FrontDataset`.
+
+        A derived feature named in *features* is computed onto this object's
+        table first, so afterwards it is a column like any other and a plot or
+        filter reading the table will find it.
+        """
         columns = self.resolve(features, stats)
+        _add_derived(self.table, columns)
         return FrontDataset.build(self.table, columns, scaling=scaling,
                                   log_channels=log_channels,
                                   ihs_channels=ihs_channels,
