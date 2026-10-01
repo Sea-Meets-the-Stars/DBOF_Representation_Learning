@@ -20,7 +20,7 @@ PIPELINES="https://gitlab.nrp-nautilus.io/jaketall/nemi_fronts/-/pipelines"
 
 # Everything the image build touches.  Add to this if the Dockerfile starts
 # COPYing something new.
-PATHS=(Dockerfile .dockerignore .gitlab-ci.yml verify_gpu.py pyproject.toml src)
+PATHS=(Dockerfile .dockerignore .gitlab-ci.yml verify_gpu.py param_sweep_fronts.py pyproject.toml src)
 
 cd "$REPO"
 git worktree prune
