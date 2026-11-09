@@ -9,7 +9,9 @@
 # the k8s device plugin, so no nvidia/cuda base image is needed.
 #
 # Build context is this repo, which is installed at the end (see FRONTS below).
-FROM condaforge/miniforge3:26.3.2-3
+# Ships conda 26.9.4, which requires CA packages without the compromised
+# emSign CAs.
+FROM condaforge/miniforge3:26.9.4-0
 
 ARG PY_VER=3.12
 ARG ENV_PREFIX=/opt/conda_envs/main_cuml
@@ -50,6 +52,8 @@ RUN conda config --set remote_connect_timeout_secs 60 \
 #   cuml=25.06       -> GPU agglomerative takes `n_neighbors`, renamed to `c`
 #                       after 25.08
 #   cuda-*-dev/cccl/nvrtc -> headers cupy needs to JIT-compile kernels
+#   ca-certificates/certifi>=2026.10.19, pip>=26.2.2
+#                    -> drop the emSign CAs compromised in the eMudhra incident
 #
 # One combined `mamba create` produced a single ~6 GB layer, and that blob could
 # not finish uploading before the registry token expired -- a 74-minute attempt
@@ -62,6 +66,7 @@ RUN mkdir -p /tmp/conda_pkgs /tmp/conda_tmp && export TMPDIR=/tmp/conda_tmp \
  && mamba create -p ${ENV_PREFIX} -y \
       -c rapidsai -c conda-forge -c nvidia \
       python=${PY_VER} "cuda-version=12.*" \
+      "ca-certificates>=2026.10.19" "certifi>=2026.10.19" "pip>=26.2.2" \
       cuda-cudart-dev cuda-cccl cuda-nvrtc \
       "numpy<2.5" "scikit-learn=1.5.*" \
  && conda clean --all -y && rm -rf /tmp/conda_pkgs /tmp/conda_tmp

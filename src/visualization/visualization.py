@@ -42,7 +42,7 @@ def _set_limits(ax, X_d, dims, pct=1.0):
         setlim(lo, hi)
 
 def _add_class_legend(ax, scatter, label_title):
-    ax.add_artist(ax.legend(*scatter.legend_elements(), title=label_title))
+    ax.add_artist(ax.legend(*scatter.legend_elements(num=None), title=label_title))
 
 
 def _annotate(fig, ax, scatter, categorical, label_title):
