@@ -17,7 +17,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
-from dbof.preprocessing.calculate_additional_fields import frontogenesis_tendency
 from scipy.optimize import minimize_scalar
 
 from front_finding.store import FrontStore
