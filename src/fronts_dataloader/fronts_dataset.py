@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
+from dbof.preprocessing.calculate_additional_fields import frontogenesis_tendency
 from scipy.optimize import minimize_scalar
 
 from front_finding.store import FrontStore
@@ -41,7 +42,7 @@ LOG_PREFIX = "grad"
 
 IHS_PREFIX = ["oce", "rossby", "strain", "mean_curv", "length",
               "okubo_weiss", "divergence", "relative_vorticity", "wind_stress_curl",
-              "W", "Eta", "U", "V", "ekman_pumping", "u_ekman", "v_ekman"]
+              "W", "Eta", "U", "V", "ekman_pumping", "u_ekman", "v_ekman", "frontogenesis_tendency"]
 
 #: Statistics of a logged channel that stay linear.  A squared gradient's
 #: magnitude statistics are strictly positive, but skew is dimensionless and
